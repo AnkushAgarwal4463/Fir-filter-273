@@ -36,8 +36,8 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "environment.yml"
-      - ".github/workflows/fir-physical-design.yml"
+      - "fir-filter-cross-design/environment.yml"
+      - ".github/workflows/fir.yml"
 
   pull_request:
     paths:
@@ -48,8 +48,8 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "environment.yml"
-      - ".github/workflows/fir-physical-design.yml"
+      - "fir-filter-cross-design/environment.yml"
+      - ".github/workflows/fir.yml"
 
 permissions:
   contents: read
@@ -96,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -f ../environment.yml
+          test -s environment.yml
 
           files=(
             Makefile
@@ -122,7 +122,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/environment.yml
+          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
@@ -256,7 +256,7 @@ jobs:
       image: openroad/orfs:latest
 
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 5
       matrix: ${{ fromJSON(needs.preflight.outputs.configurations) }}
 
