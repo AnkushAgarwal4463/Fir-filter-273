@@ -1,0 +1,11 @@
+
+name: fir-pd
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - pyyaml
+  - iverilog
+  - make
