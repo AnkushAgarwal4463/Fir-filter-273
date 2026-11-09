@@ -1,0 +1,561 @@
+
+name: FIR Synthesis and Physical Design
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Choose full sweep or single configuration"
+        required: true
+        type: choice
+        options: [sweep, single]
+        default: sweep
+      taps:
+        description: "FIR taps (single mode)"
+        required: true
+        default: "8"
+      data_width:
+        description: "Data width (single mode)"
+        required: true
+        default: "8"
+      utilization:
+        description: "Target utilization (%) (single mode)"
+        required: true
+        default: "40"
+      clock_period:
+        description: "Clock period in ns (single mode)"
+        required: true
+        default: "10.0"
+
+  push:
+    paths:
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
+
+  pull_request:
+    paths:
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fir-filter-cross-design
+    shell: bash -el {0}
+
+concurrency:
+  group: fir-pd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+  SINGLE_TAPS: ${{ inputs.taps || '8' }}
+  SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
+  SINGLE_UTIL: ${{ inputs.utilization || '40' }}
+  SINGLE_CLOCK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+
+jobs:
+
+  # --------------------------------------------------
+  # PREFLIGHT
+  # --------------------------------------------------
+
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    container:
+      image: openroad/orfs:latest
+
+    outputs:
+      configurations: ${{ steps.matrix.outputs.configurations }}
+      expected_count: ${{ steps.matrix.outputs.expected_count }}
+
+    steps:
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check project structure
+        run: |
+          set -euo pipefail
+
+          test -f ../environment.yml
+
+          files=(
+            Makefile
+            rtl/fir_filter.v
+            tb/tb_fir_filter.v
+            scripts/run_fir_flow.sh
+            scripts/flow_fir.tcl
+            scripts/synth_fir.ys
+            scripts/extract_fir_features.py
+            scripts/combine_fir_results.py
+            constraints/fir_filter.sdc.in
+            config/sky130_example.env
+          )
+
+          for file in "${files[@]}"; do
+            test -s "$file" || {
+              echo "ERROR: Missing or empty required file: $file"
+              exit 1
+            }
+            echo "FOUND: $file"
+          done
+
+      - name: Set up Python and EDA environment
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ${{ github.workspace }}/environment.yml
+          environment-name: fir-pd-flow
+          cache-environment: true
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Verify tools and run RTL simulation
+        run: |
+          set -euo pipefail
+
+          source /OpenROAD-flow-scripts/env.sh
+
+          python --version
+          yosys -V
+          openroad -version
+
+          bash -n scripts/run_fir_flow.sh
+
+          python -m py_compile \
+            scripts/extract_fir_features.py \
+            scripts/combine_fir_results.py
+
+          make sim
+
+      - name: Generate configuration matrix
+        id: matrix
+        env:
+          MODE: ${{ env.RUN_MODE }}
+          TAPS: ${{ env.SINGLE_TAPS }}
+          DATA_WIDTH: ${{ env.SINGLE_DATA_WIDTH }}
+          UTILIZATION: ${{ env.SINGLE_UTIL }}
+          SINGLE_CLOCK_PERIOD: ${{ env.SINGLE_CLOCK_PERIOD }}
+
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+
+          mode = os.environ["MODE"]
+
+          periods = (5.0, 7.5, 10.0)
+
+          if mode == "single":
+
+              selected_period = float(
+                  os.environ["SINGLE_CLOCK_PERIOD"]
+              )
+
+              if selected_period <= 0:
+                  raise SystemExit(
+                      "Clock period must be greater than zero."
+                  )
+
+              configs = [{
+                  "taps": int(os.environ["TAPS"]),
+                  "data_width": int(os.environ["DATA_WIDTH"]),
+                  "utilization": int(os.environ["UTILIZATION"]),
+                  "clock_period": selected_period,
+              }]
+
+          elif mode == "sweep":
+
+              base = [
+                  (taps, width, util)
+                  for taps, widths in (
+                      (4, (8, 16, 24, 32, 40, 48)),
+                      (8, (8, 16, 24, 32, 40, 48)),
+                      (12, (8,))
+                  )
+                  for width in widths
+                  for util in (20, 30, 40, 50, 60, 70, 80)
+              ]
+
+              if len(base) != 91:
+                  raise SystemExit(
+                      f"Expected 91 base configurations, got {len(base)}"
+                  )
+
+              configs = [
+                  {
+                      "taps": taps,
+                      "data_width": width,
+                      "utilization": util,
+                      "clock_period": period,
+                  }
+                  for taps, width, util in base
+                  for period in periods
+              ]
+
+          else:
+              raise SystemExit(
+                  f"Unsupported RUN_MODE: {mode}"
+              )
+
+          if mode == "sweep" and len(configs) != 273:
+              raise SystemExit(
+                  f"Expected 273 configurations, got {len(configs)}"
+              )
+
+          matrix_json = json.dumps(
+              {"include": configs},
+              separators=(",", ":")
+          )
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(f"configurations={matrix_json}\n")
+              out.write(f"expected_count={len(configs)}\n")
+
+          print(f"Run mode: {mode}")
+          print(f"Clock periods: {periods}")
+          print(f"Number of configurations: {len(configs)}")
+          PY
+
+  # --------------------------------------------------
+  # FIR PHYSICAL DESIGN MATRIX
+  # --------------------------------------------------
+
+  fir-physical-design:
+    needs: preflight
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    container:
+      image: openroad/orfs:latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.preflight.outputs.configurations) }}
+
+    env:
+      TAPS: ${{ matrix.taps }}
+      DATA_WIDTH: ${{ matrix.data_width }}
+      COEFF_WIDTH: 8
+      UTIL: ${{ matrix.utilization }}
+      CLK_PERIOD: ${{ matrix.clock_period }}
+
+      # Diagnostic sweep: timing repair disabled.
+      ENABLE_REPAIR_TIMING: "0"
+
+    steps:
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and EDA environment
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ${{ github.workspace }}/environment.yml
+          environment-name: fir-pd-flow
+          cache-environment: true
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Configure and verify Sky130HD PDK
+        run: |
+          set -euo pipefail
+
+          source /OpenROAD-flow-scripts/env.sh
+
+          ORFS_PLATFORM="/OpenROAD-flow-scripts/flow/platforms/sky130hd"
+
+          export LIBERTY="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+          export TECH_LEF="$ORFS_PLATFORM/lef/sky130_fd_sc_hd.tlef"
+          export CELL_LEF="$ORFS_PLATFORM/lef/sky130_fd_sc_hd_merged.lef"
+
+          for file in "$LIBERTY" "$TECH_LEF" "$CELL_LEF"; do
+            test -s "$file" || {
+              echo "ERROR: Missing PDK file: $file"
+              exit 1
+            }
+            echo "FOUND: $file"
+          done
+
+          sed -i -E \
+            "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY\"|" \
+            config/sky130_example.env
+
+          sed -i -E \
+            "s|^export TECH_LEF=.*|export TECH_LEF=\"$TECH_LEF\"|" \
+            config/sky130_example.env
+
+          sed -i -E \
+            "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF\"|" \
+            config/sky130_example.env
+
+      - name: Verify configuration
+        run: |
+          set -euo pipefail
+
+          echo "TAPS=$TAPS"
+          echo "DATA_WIDTH=$DATA_WIDTH"
+          echo "UTIL=$UTIL"
+          echo "CLK_PERIOD=$CLK_PERIOD"
+          echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
+
+          test "$ENABLE_REPAIR_TIMING" = "0"
+
+      - name: Run FIR physical-design configuration
+        id: physical_flow
+        run: |
+          set -euo pipefail
+
+          source /OpenROAD-flow-scripts/env.sh
+
+          chmod +x scripts/run_fir_flow.sh
+
+          echo "Configuration:"
+          echo "TAPS=$TAPS"
+          echo "DATA_WIDTH=$DATA_WIDTH"
+          echo "UTIL=$UTIL"
+          echo "CLK_PERIOD=$CLK_PERIOD ns"
+          echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
+
+          ./scripts/run_fir_flow.sh
+
+      - name: Record configuration status and failure diagnostics
+        if: always()
+        env:
+          FLOW_OUTCOME: ${{ steps.physical_flow.outcome }}
+
+        run: |
+          set -euo pipefail
+
+          mkdir -p fir_project/matrix-status
+
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          taps = int(os.environ["TAPS"])
+          data_width = int(os.environ["DATA_WIDTH"])
+          coeff_width = int(os.environ["COEFF_WIDTH"])
+          utilization = int(os.environ["UTIL"])
+          clock = float(os.environ["CLK_PERIOD"])
+
+          repair_mode = os.environ.get(
+              "ENABLE_REPAIR_TIMING", "1"
+          )
+
+          acc_width = data_width + coeff_width + 8
+
+          run_id = (
+              f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
+              f"_aw{acc_width}_u{utilization}_clk{clock:g}"
+          )
+
+          if repair_mode == "0":
+              run_id += "_tr0"
+
+          run_dir = Path("fir_project/runs") / run_id
+
+          stage = "unknown"
+
+          status_csv = run_dir / "fir_features_status.csv"
+
+          if status_csv.is_file():
+              try:
+                  with status_csv.open(
+                      newline="",
+                      encoding="utf-8-sig"
+                  ) as handle:
+
+                      rows = list(csv.DictReader(handle))
+
+                  if rows:
+                      stage = (
+                          rows[-1].get("last_completed_stage")
+                          or "unknown"
+                      )
+
+              except (OSError, csv.Error):
+                  pass
+
+          reason = ""
+
+          for log_path in (
+              run_dir / "openroad_log.txt",
+              run_dir / "flow_diagnostics.log",
+              run_dir / "synthesis.log",
+          ):
+
+              if not log_path.is_file():
+                  continue
+
+              try:
+                  lines = log_path.read_text(
+                      encoding="utf-8",
+                      errors="replace"
+                  ).splitlines()
+
+              except OSError:
+                  continue
+
+              matches = [
+                  line.strip()
+                  for line in lines
+                  if re.search(
+                      r"\b(ERROR|FATAL)\b|No access point",
+                      line,
+                      re.I
+                  )
+              ]
+
+              if matches:
+                  reason = matches[-1][-1000:]
+                  break
+
+          record = {
+              "run_id": run_id,
+              "taps": taps,
+              "data_width": data_width,
+              "coeff_width": coeff_width,
+              "acc_width": acc_width,
+              "utilization": utilization,
+              "place_density": utilization / 100.0,
+              "clock_period": clock,
+              "clock_period_ns": clock,
+              "frequency_mhz": 1000.0 / clock,
+              "repair_timing_enabled": repair_mode == "1",
+              "job_outcome": os.environ.get(
+                  "FLOW_OUTCOME", "unknown"
+              ),
+              "last_completed_stage": stage,
+              "failure_reason": reason,
+          }
+
+          output_file = (
+              Path("fir_project/matrix-status")
+              / f"{run_id}.json"
+          )
+
+          output_file.write_text(
+              json.dumps(record, indent=2) + "\n",
+              encoding="utf-8"
+          )
+
+          print(json.dumps(record, indent=2))
+          PY
+
+      - name: Upload this configuration's artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fir-config-t${{ matrix.taps }}-dw${{ matrix.data_width }}-u${{ matrix.utilization }}-clk${{ matrix.clock_period }}-tr0
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            fir-filter-cross-design/fir_project/runs/**
+            fir-filter-cross-design/fir_project/matrix-status/**
+
+  # --------------------------------------------------
+  # COMBINE RESULTS
+  # --------------------------------------------------
+
+  combine-results:
+    needs:
+      - preflight
+      - fir-physical-design
+
+    if: ${{ always() && needs.preflight.result == 'success' && (needs.fir-physical-design.result == 'success' || needs.fir-physical-design.result == 'failure') }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download configuration artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fir-config-*
+          path: fir-filter-cross-design/artifacts
+          merge-multiple: false
+          if-no-artifact-found: error
+
+      - name: Verify downloaded artifacts
+        run: |
+          set -euo pipefail
+      
+          echo "Downloaded artifacts:"
+          if [ -d artifacts ]; then
+            find artifacts -type f -print 2>/dev/null | sed -n '1,50p'
+          else
+            echo "ERROR: artifacts directory not found"
+            exit 1
+          fi
+      
+          test -d artifacts
+
+      - name: Build combined CSV
+        env:
+          RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+          SINGLE_TAPS: ${{ inputs.taps || '8' }}
+          SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
+          SINGLE_UTIL: ${{ inputs.utilization || '40' }}
+          SINGLE_CLOCK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+
+        run: |
+          set -euo pipefail
+
+          test -s scripts/combine_fir_results.py
+
+          python3 scripts/combine_fir_results.py \
+            --artifacts artifacts \
+            --output combined_fir_features.csv \
+            --run-mode "$RUN_MODE" \
+            --single-taps "$SINGLE_TAPS" \
+            --single-data-width "$SINGLE_DATA_WIDTH" \
+            --single-utilization "$SINGLE_UTIL" \
+            --single-clock-period "$SINGLE_CLOCK_PERIOD" \
+            --clock-periods "5,7.5,10"
+
+          test -s combined_fir_features.csv
+
+          echo "Combined FIR CSV generated successfully."
+          ls -lh combined_fir_features.csv
+
+      - name: Upload combined CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: fir-combined-results-${{ github.run_number }}
+          path: fir-filter-cross-design/combined_fir_features.csv
+          if-no-files-found: error
+          retention-days: 14
