@@ -1,0 +1,37 @@
+# Parameterized FIR synthesis script. run_fir_flow.sh replaces every token.
+read_verilog -sv rtl/fir_filter.v
+
+chparam -set DATA_WIDTH __DATA_WIDTH__ \
+        -set COEFF_WIDTH __COEFF_WIDTH__ \
+        -set TAPS __TAPS__ \
+        -set ACC_WIDTH __ACC_WIDTH__ fir_filter
+
+hierarchy -check -top fir_filter
+
+proc
+flatten
+opt
+fsm
+opt
+memory
+opt
+techmap
+opt
+
+dfflibmap -liberty "__LIB_FILE__"
+abc -liberty "__LIB_FILE__"
+
+opt
+clean
+
+hilomap -singleton \
+    -hicell sky130_fd_sc_hd__conb_1 HI \
+    -locell sky130_fd_sc_hd__conb_1 LO
+
+opt
+clean
+check
+
+write_json "__NETLIST_JSON__"
+write_verilog -noattr -noexpr "__NETLIST_VERILOG__"
+stat -liberty "__LIB_FILE__"
