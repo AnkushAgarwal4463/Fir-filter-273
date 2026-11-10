@@ -512,10 +512,11 @@ def parse_congestion_metrics(text: str) -> dict[str, float | None]:
     if not text or not text.strip():
         return result
 
-    # Limit parsing to the final congestion table when the standard header is
-    # present. This avoids accidentally consuming unrelated numeric log lines.
-    header = re.search(r"(?im)^.*Final congestion report:\s*$", text)
-    table_text = text[header.end():] if header else text
+    # If a log contains more than one global-route pass, parse only the last
+    # GRT summary. Dedicated report_congestion summary files have no such header
+    # and are parsed directly.
+    headers = list(re.finditer(r"(?im)^.*Final congestion report:\s*$", text))
+    table_text = text[headers[-1].end():] if headers else text
     row_re = re.compile(
         rf"(?im)^\s*(li1|met[1-5]|Total)\s+({NUM})\s+({NUM})\s+({NUM})%\s+({NUM})\s*/\s*({NUM})\s*/\s*({NUM})\s*$"
     )
@@ -553,12 +554,15 @@ def parse_congestion(text: str) -> float | None:
     return parse_congestion_metrics(text)["grt_total_congestion"]
 
 
-def parse_congestion_status(text: str) -> str | None:
+def parse_congestion_status(
+    text: str,
+    key: str = "GLOBAL_ROUTE_HAS_CONGESTION",
+) -> str | None:
     """Read only an explicitly written global-route Boolean status."""
     if not text:
         return None
     match = re.search(
-        r"(?im)^\s*GLOBAL_ROUTE_HAS_CONGESTION:\s*(true|false|0|1)\s*$",
+        rf"(?im)^\s*{re.escape(key)}:\s*(true|false|0|1)\s*$",
         text,
     )
     if not match:
@@ -599,6 +603,20 @@ def find_global_route_source(run_dir: Path, logs: dict[str, str]) -> tuple[str |
             return f"{name} (GRT-0096 Final congestion report)", content, metrics
 
     return None, "", empty_grt_metrics()
+
+
+def read_grt_summary(
+    run_dir: Path,
+    filename: str,
+) -> tuple[str | None, dict[str, float | None]]:
+    """Read a report_congestion summary table written with OpenROAD tee."""
+    path = run_dir / filename
+    if not path.is_file():
+        return None, empty_grt_metrics()
+    metrics = parse_congestion_metrics(read_text(path))
+    if metrics["grt_total_resource"] is None:
+        return str(path), empty_grt_metrics()
+    return str(path), metrics
 
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
@@ -720,16 +738,38 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     route_name, route_text = choose_routing_log(logs)
     all_logs = "\n".join(logs.values())
 
-    # Numeric congestion must come from a dedicated global-routing source.
-    congestion_source, congestion_text, congestion_metrics = find_global_route_source(run_dir, logs)
-    # The Tcl status report is a Boolean only; do not use detailed-route or
-    # unrelated logs to infer global-route status.
+    # Prefer the dedicated report_congestion summary produced immediately
+    # after each GRT pass. Fall back to the existing GRT report/log parser.
+    congestion_source, congestion_metrics = read_grt_summary(
+        run_dir, "final_congestion_summary.rpt"
+    )
+    if congestion_metrics["grt_total_resource"] is None:
+        congestion_source, congestion_text, congestion_metrics = (
+            find_global_route_source(run_dir, logs)
+        )
+    else:
+        congestion_text = read_text(run_dir / "final_congestion_summary.rpt")
+
+    initial_congestion_source, initial_congestion_raw = read_grt_summary(
+        run_dir, "initial_congestion_summary.rpt"
+    )
+    initial_congestion_metrics = {
+        f"initial_{key}": value
+        for key, value in initial_congestion_raw.items()
+    }
+
+    # Boolean statuses are diagnostics only; numeric congestion comes from
+    # the GRT summary table and is never inferred from these flags.
     status_path = run_dir / "congestion_status.rpt"
     if not status_path.is_file():
         status_path = run_dir / "congestion_overflow.rpt"  # legacy status filename
-    congestion_status = parse_congestion_status(read_text(status_path))
+    status_text = read_text(status_path)
+    congestion_status = parse_congestion_status(status_text)
     if congestion_status is None:
         congestion_status = parse_congestion_status(congestion_text)
+    initial_congestion_status = parse_congestion_status(
+        status_text, "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION"
+    )
 
     # Parse each timing metric independently.
     # Do not use one generic timing parser for setup and hold.
@@ -807,7 +847,10 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
         **{key: ("measured" if value is not None else "unavailable")
            for key, value in congestion_metrics.items()},
+        **{key: ("measured" if value is not None else "unavailable")
+           for key, value in initial_congestion_metrics.items()},
         "congestion_status": "measured" if congestion_status is not None else "unavailable",
+        "initial_congestion_status": "measured" if initial_congestion_status is not None else "unavailable",
         "wirelength_um": "measured" if route["wirelength_um"] is not None else "unavailable",
         "via_count": "measured" if route["via_count"] is not None else "unavailable",
         "final_detailed_route_violations": "measured" if route["final_detailed_route_violations"] is not None else "unavailable",
@@ -835,11 +878,14 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         **congestion_metrics,
+        **initial_congestion_metrics,
         "congestion_status": congestion_status,
+        "initial_congestion_status": initial_congestion_status,
         "setup_report_source": str(setup_path) if setup_path else ("logs" if setup_src else None),
         "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_src else None),
         "hold_report_source": str(hold_path) if hold_path else ("logs" if hold_src else None),
         "congestion_report_source": congestion_source,
+        "initial_congestion_report_source": initial_congestion_source,
         "routing_log_source": route_name,
         "log_files_found": list(logs),
         "target_measurement_status": measurements,
@@ -956,9 +1002,17 @@ DISPLAY_NAMES = {
     "grt_max_horizontal_congestion": "GRT maximum horizontal congestion",
     "grt_max_vertical_congestion": "GRT maximum vertical congestion",
     "grt_total_congestion": "GRT total congestion",
-    "congestion_status": "Global-route congestion status",
+    "congestion_status": "Final global-route congestion status",
+    "initial_congestion_status": "Initial global-route congestion status",
+    "initial_grt_total_resource": "Initial GRT total routing resources",
+    "initial_grt_total_demand": "Initial GRT total routing demand",
+    "initial_grt_usage_percent": "Initial GRT total resource usage (%)",
+    "initial_grt_max_horizontal_congestion": "Initial GRT maximum horizontal congestion",
+    "initial_grt_max_vertical_congestion": "Initial GRT maximum vertical congestion",
+    "initial_grt_total_congestion": "Initial GRT total congestion",
     "setup_report_source": "Setup timing report source", "tns_report_source": "TNS report source",
-    "hold_report_source": "Hold timing report source", "congestion_report_source": "Congestion report source",
+    "hold_report_source": "Hold timing report source", "congestion_report_source": "Final congestion summary source",
+    "initial_congestion_report_source": "Initial congestion summary source",
     "routing_log_source": "Routing log source", "note": "Notes / limitations",
     "target_feature_stage": "Target stage / ML leakage warning", "run_id": "Run ID",
     "taps": "FIR taps", "data_width": "Data width (bits)", "coeff_width": "Coefficient width (bits)",
@@ -975,6 +1029,15 @@ for _layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
         f"grt_{_layer}_max_horizontal_congestion": f"{_layer} max horizontal congestion",
         f"grt_{_layer}_max_vertical_congestion": f"{_layer} max vertical congestion",
         f"grt_{_layer}_total_congestion": f"{_layer} total congestion",
+    })
+
+    DISPLAY_NAMES.update({
+        f"initial_grt_{_layer}_resource": f"Initial {_layer} routing resources",
+        f"initial_grt_{_layer}_demand": f"Initial {_layer} routing demand",
+        f"initial_grt_{_layer}_usage_percent": f"Initial {_layer} resource usage (%)",
+        f"initial_grt_{_layer}_max_horizontal_congestion": f"Initial {_layer} max horizontal congestion",
+        f"initial_grt_{_layer}_max_vertical_congestion": f"Initial {_layer} max vertical congestion",
+        f"initial_grt_{_layer}_total_congestion": f"Initial {_layer} total congestion",
     })
 
 
@@ -1031,7 +1094,9 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "via_count", "final_detailed_route_violations", "effective_place_density",
         "effective_place_density_method", "placed_cell_area_from_def_um2", "placement_row_area_um2",
         "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns",
-        *empty_grt_metrics().keys(), "congestion_status",
+        *empty_grt_metrics().keys(),
+        *[f"initial_{key}" for key in empty_grt_metrics().keys()],
+        "congestion_status", "initial_congestion_status",
     ]
     synthesis_keys = [
         "cell_count", "netname_count", "port_count", "port_bit_count", "sequential_cell_count",
@@ -1050,7 +1115,7 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "## 3. Physical-design results", "",
         markdown_table([(DISPLAY_NAMES.get(k, k.replace("_", " ").title()), post.get(k)) for k in physical_keys]), "",
         "## 4. Measurement sources and status", "",
-        markdown_table([(DISPLAY_NAMES.get(k, k.replace("_", " ").title()), post.get(k)) for k in ("setup_report_source", "tns_report_source", "hold_report_source", "congestion_report_source", "routing_log_source", "target_feature_stage", "note")]), "",
+        markdown_table([(DISPLAY_NAMES.get(k, k.replace("_", " ").title()), post.get(k)) for k in ("setup_report_source", "tns_report_source", "hold_report_source", "congestion_report_source", "initial_congestion_report_source", "routing_log_source", "target_feature_stage", "note")]), "",
         "## 5. Interpretation notes", "",
         "- `N/A (not extracted)` means the extractor did not find a trustworthy value; it does **not** mean zero.",
         "- Routed-net and route-segment counts parsed from DEF are approximate.",
@@ -1332,10 +1397,15 @@ def main() -> int:
     print(f"Final DEF     : {post['final_def_available']}")
     print(f"Final ODB     : {post['final_odb_available']}")
     print(f"Routing success marker: {post['detailed_route_success_marker_found']}")
+    print(f"Initial GRT congestion status: {post.get('initial_congestion_status')}")
+    print(f"Final GRT congestion status: {post.get('congestion_status')}")
 
     print("===== Physical Targets =====")
     for key in (
         "wns_setup_ns", "tns_setup_ns", "wns_hold_ns",
+        "initial_grt_total_resource", "initial_grt_total_demand", "initial_grt_usage_percent",
+        "initial_grt_max_horizontal_congestion", "initial_grt_max_vertical_congestion",
+        "initial_grt_total_congestion",
         "grt_total_resource", "grt_total_demand", "grt_usage_percent",
         "grt_max_horizontal_congestion", "grt_max_vertical_congestion", "grt_total_congestion",
         "wirelength_um", "via_count", "final_detailed_route_violations",
