@@ -278,7 +278,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/environment.yml
+          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
@@ -481,8 +481,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: |
-            fir-filter-cross-design/fir_project/runs/**
-            fir-filter-cross-design/fir_project/matrix-status/**
+            fir_project/runs/**
+            fir_project/matrix-status/**
 
   # --------------------------------------------------
   # COMBINE RESULTS
