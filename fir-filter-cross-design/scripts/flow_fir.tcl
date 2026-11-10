@@ -179,50 +179,86 @@ if {$enable_repair_timing == 1} {
 }
 
 # ------------------------------------------------------------
-# 12. Global routing and congestion report
+# 12. Initial and final global-routing congestion measurements
 # ------------------------------------------------------------
 
-# OpenROAD writes the detailed per-layer GRT table to its console log
-# (GRT-0096 Final congestion report). The extractor reads that table from
-# openroad_log.txt. The -congestion_report_file output is retained as an
-# additional artifact when supported by this OpenROAD build.
+# The first pass measures the routing pressure before congestion-reduction
+# iterations. Its ODB is saved so the diagnostic routing state can be restored
+# before the normal routing pass.
 
-set congestion_report "$::env(RUN_DIR)/congestion.rpt"
+set pre_grt_odb "$::env(RUN_DIR)/pre_grt.odb"
+set initial_congestion_gcell_report "$::env(RUN_DIR)/initial_congestion.rpt"
+set initial_congestion_summary "$::env(RUN_DIR)/initial_congestion_summary.rpt"
+set final_congestion_gcell_report "$::env(RUN_DIR)/congestion.rpt"
+set final_congestion_summary "$::env(RUN_DIR)/final_congestion_summary.rpt"
 set congestion_status_report "$::env(RUN_DIR)/congestion_status.rpt"
 
-fir_log "GLOBAL_ROUTE_CONGESTION_REPORT_REQUESTED: $congestion_report"
-fir_step "global_routing" [list global_route \
-    -congestion_report_file $congestion_report \
+fir_step "write_pre_grt_odb" [list write_db $pre_grt_odb]
+
+# PASS 1: zero congestion-reduction iterations. OpenROAD still performs
+# global routing and allows the initial overflow state to be reported.
+fir_log "INITIAL_GLOBAL_ROUTE_STARTED"
+fir_step "initial_global_routing" [list global_route \
+    -congestion_iterations 0 \
+    -allow_congestion \
+    -congestion_report_file $initial_congestion_gcell_report \
     -verbose]
 
-# has_congestion is a Boolean diagnostic only. It is NOT a numeric overflow
-# measurement and is not substituted for the GRT-0096 resource/demand table.
-if {[catch {has_congestion} congestion_flag]} {
-    set congestion_status "unavailable"
-    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
-    fir_log "WARNING: Could not query global-routing congestion: $congestion_flag"
+set initial_congestion_status "unavailable"
+if {[catch {has_congestion} initial_flag]} {
+    fir_log "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
+    fir_log "WARNING: Initial has_congestion query failed: $initial_flag"
 } else {
-    set congestion_flag [expr {$congestion_flag ? 1 : 0}]
-    if {$congestion_flag} {
-        set congestion_status "true"
-    } else {
-        set congestion_status "false"
-    }
-    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
+    set initial_congestion_status [expr {$initial_flag ? "true" : "false"}]
+    fir_log "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: $initial_congestion_status"
 }
 
-set congestion_report_generated 0
-if {[file exists $congestion_report] && [file size $congestion_report] > 0} {
-    set congestion_report_generated 1
-    fir_log "CONGESTION_REPORT_GENERATED: $congestion_report"
+# Capture the numeric per-layer overflow table. This is distinct from the
+# GCell DRC-viewer report written by -congestion_report_file.
+if {[catch {
+    tee -file $initial_congestion_summary { report_congestion }
+} result]} {
+    fir_log "WARNING: Initial numeric congestion summary unavailable: $result"
 } else {
-    fir_log "CONGESTION_REPORT_FILE_UNAVAILABLE: $congestion_report"
-    fir_log "INFO: GRT-0096 table remains available in openroad_log.txt when emitted by OpenROAD"
+    fir_log "INITIAL_CONGESTION_SUMMARY: $initial_congestion_summary"
+}
+
+# Restore the pre-GRT database before the production routing pass. This keeps
+# the diagnostic zero-iteration routes out of the normal detailed-route flow.
+fir_step "restore_pre_grt_odb" [list read_db $pre_grt_odb]
+# Reapply the design SDC after restoring the database checkpoint.
+fir_step "reread_sdc_after_pre_grt_restore" [list read_sdc $::env(SDC)]
+fir_step "reapply_wire_rc_after_pre_grt_restore" [list set_wire_rc -layer met2]
+
+# PASS 2: normal global routing. The resulting guides feed detailed_route.
+fir_log "FINAL_GLOBAL_ROUTE_STARTED"
+fir_step "global_routing" [list global_route \
+    -congestion_report_file $final_congestion_gcell_report \
+    -verbose]
+
+set final_congestion_status "unavailable"
+if {[catch {has_congestion} final_flag]} {
+    fir_log "FINAL_GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
+    fir_log "WARNING: Final has_congestion query failed: $final_flag"
+} else {
+    set final_congestion_status [expr {$final_flag ? "true" : "false"}]
+    fir_log "FINAL_GLOBAL_ROUTE_HAS_CONGESTION: $final_congestion_status"
+}
+
+if {[catch {
+    tee -file $final_congestion_summary { report_congestion }
+} result]} {
+    fir_log "WARNING: Final numeric congestion summary unavailable: $result"
+} else {
+    fir_log "FINAL_CONGESTION_SUMMARY: $final_congestion_summary"
 }
 
 set fd [open $congestion_status_report w]
-puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
-puts $fd "CONGESTION_REPORT_GENERATED: $congestion_report_generated"
+puts $fd "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: $initial_congestion_status"
+puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $final_congestion_status"
+puts $fd "FINAL_GLOBAL_ROUTE_HAS_CONGESTION: $final_congestion_status"
+puts $fd "INITIAL_CONGESTION_SUMMARY: $initial_congestion_summary"
+puts $fd "FINAL_CONGESTION_SUMMARY: $final_congestion_summary"
 close $fd
 
 # Explicit global-route wirelength report (microns, as reported by OpenROAD).
