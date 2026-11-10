@@ -256,7 +256,7 @@ jobs:
       image: openroad/orfs:latest
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       max-parallel: 5
       matrix: ${{ fromJSON(needs.preflight.outputs.configurations) }}
 
@@ -481,8 +481,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: |
-            fir_project/runs/**
-            fir_project/matrix-status/**
+            fir-filter-cross-design/fir_project/runs/**
+            fir-filter-cross-design/fir_project/matrix-status/**
 
   # --------------------------------------------------
   # COMBINE RESULTS
@@ -506,23 +506,30 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: fir-config-*
-          path: fir-filter-cross-design/artifacts
+          path: ${{ github.workspace }}/fir-filter-cross-design/artifacts
           merge-multiple: false
-          if-no-artifact-found: error
+          if-no-artifact-found: warn
 
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
       
-          echo "Downloaded artifacts:"
-          if [ -d artifacts ]; then
-            find artifacts -type f -print 2>/dev/null | sed -n '1,50p'
-          else
-            echo "ERROR: artifacts directory not found"
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/fir-filter-cross-design/artifacts"
+
+          echo "Artifact directory: $ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+
+          echo "Downloaded artifact files:"
+          find "$ARTIFACT_DIR" -type f -print | sed -n '1,100p'
+
+          FILE_COUNT="$(find "$ARTIFACT_DIR" -type f | wc -l)"
+          echo "Downloaded file count: $FILE_COUNT"
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: No fir-config-* artifacts were downloaded."
+            echo "Check the matrix upload steps and their artifact names/paths."
             exit 1
           fi
-      
-          test -d artifacts
 
       - name: Build combined CSV
         env:
@@ -538,7 +545,7 @@ jobs:
           test -s scripts/combine_fir_results.py
 
           python3 scripts/combine_fir_results.py \
-            --artifacts artifacts \
+            --artifacts "$GITHUB_WORKSPACE/fir-filter-cross-design/artifacts" \
             --output combined_fir_features.csv \
             --run-mode "$RUN_MODE" \
             --single-taps "$SINGLE_TAPS" \
