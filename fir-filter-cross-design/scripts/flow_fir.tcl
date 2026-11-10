@@ -1,3 +1,4 @@
+
 # FIR physical-design flow for OpenROAD / Sky130HD.
 #
 # Required environment:
@@ -182,55 +183,76 @@ if {$enable_repair_timing == 1} {
 # 12. Initial and final global-routing congestion measurements
 # ------------------------------------------------------------
 
-# The first pass measures the routing pressure before congestion-reduction
-# iterations. Its ODB is saved so the diagnostic routing state can be restored
-# before the normal routing pass.
+# Save the post-placement / pre-GRT checkpoint in the main OpenROAD session.
+# The diagnostic zero-iteration route is run in a SECOND OpenROAD process,
+# which reads this checkpoint. This avoids ORD-0047: read_db cannot replace
+# an already-populated database in the current process.
 
 set pre_grt_odb "$::env(RUN_DIR)/pre_grt.odb"
 set initial_congestion_gcell_report "$::env(RUN_DIR)/initial_congestion.rpt"
 set initial_congestion_summary "$::env(RUN_DIR)/initial_congestion_summary.rpt"
+set initial_congestion_log "$::env(RUN_DIR)/initial_congestion_openroad.log"
+set initial_congestion_script "$::env(RUN_DIR)/initial_congestion_diagnostic.tcl"
 set final_congestion_gcell_report "$::env(RUN_DIR)/congestion.rpt"
 set final_congestion_summary "$::env(RUN_DIR)/final_congestion_summary.rpt"
 set congestion_status_report "$::env(RUN_DIR)/congestion_status.rpt"
 
 fir_step "write_pre_grt_odb" [list write_db $pre_grt_odb]
 
-# PASS 1: zero congestion-reduction iterations. OpenROAD still performs
-# global routing and allows the initial overflow state to be reported.
-fir_log "INITIAL_GLOBAL_ROUTE_STARTED"
-fir_step "initial_global_routing" [list global_route \
+# Build a small Tcl script for a clean OpenROAD process. The ODB contains the
+# placed design/technology database; Liberty and SDC are reloaded for timing
+# and routing setup. All file paths are Tcl-list quoted to handle spaces.
+set diagnostic_fd [open $initial_congestion_script w]
+puts $diagnostic_fd [list read_db $pre_grt_odb]
+puts $diagnostic_fd [list read_liberty $::env(LIBERTY)]
+puts $diagnostic_fd [list read_sdc $::env(SDC)]
+puts $diagnostic_fd [list set_wire_rc -layer met2]
+puts $diagnostic_fd [list global_route \
     -congestion_iterations 0 \
     -allow_congestion \
     -congestion_report_file $initial_congestion_gcell_report \
     -verbose]
+puts $diagnostic_fd {if {[catch {has_congestion} initial_flag]} {
+    puts "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
+} else {
+    set initial_status [expr {$initial_flag ? "true" : "false"}]
+    puts "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: $initial_status"
+}}
+puts $diagnostic_fd [list tee -file $initial_congestion_summary [list report_congestion]]
+close $diagnostic_fd
 
 set initial_congestion_status "unavailable"
-if {[catch {has_congestion} initial_flag]} {
-    fir_log "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
-    fir_log "WARNING: Initial has_congestion query failed: $initial_flag"
-} else {
-    set initial_congestion_status [expr {$initial_flag ? "true" : "false"}]
-    fir_log "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: $initial_congestion_status"
-}
-
-# Capture the numeric per-layer overflow table. This is distinct from the
-# GCell DRC-viewer report written by -congestion_report_file.
+fir_log "INITIAL_GLOBAL_ROUTE_DIAGNOSTIC_STARTED_IN_FRESH_PROCESS"
+set diagnostic_command [list [info nameofexecutable] -exit $initial_congestion_script]
 if {[catch {
-    tee -file $initial_congestion_summary { report_congestion }
-} result]} {
-    fir_log "WARNING: Initial numeric congestion summary unavailable: $result"
+    exec {*}$diagnostic_command > $initial_congestion_log 2>@1
+} diagnostic_result]} {
+    fir_log "WARNING: Initial congestion diagnostic process failed: $diagnostic_result"
+    fir_log "INITIAL_CONGESTION_DIAGNOSTIC_LOG: $initial_congestion_log"
 } else {
-    fir_log "INITIAL_CONGESTION_SUMMARY: $initial_congestion_summary"
+    fir_log "INITIAL_GLOBAL_ROUTE_DIAGNOSTIC_COMPLETED"
+    fir_log "INITIAL_CONGESTION_DIAGNOSTIC_LOG: $initial_congestion_log"
+    if {[file exists $initial_congestion_log]} {
+        set diagnostic_log_fd [open $initial_congestion_log r]
+        set diagnostic_text [read $diagnostic_log_fd]
+        close $diagnostic_log_fd
+        if {[regexp -nocase {INITIAL_GLOBAL_ROUTE_HAS_CONGESTION:\s*(true|false)} \
+            $diagnostic_text -> initial_flag_text]} {
+            set initial_congestion_status [string tolower $initial_flag_text]
+        }
+    }
 }
 
-# Restore the pre-GRT database before the production routing pass. This keeps
-# the diagnostic zero-iteration routes out of the normal detailed-route flow.
-fir_step "restore_pre_grt_odb" [list read_db $pre_grt_odb]
-# Reapply the design SDC after restoring the database checkpoint.
-fir_step "reread_sdc_after_pre_grt_restore" [list read_sdc $::env(SDC)]
-fir_step "reapply_wire_rc_after_pre_grt_restore" [list set_wire_rc -layer met2]
+fir_log "INITIAL_GLOBAL_ROUTE_HAS_CONGESTION: $initial_congestion_status"
+if {[file exists $initial_congestion_summary]} {
+    fir_log "INITIAL_CONGESTION_SUMMARY: $initial_congestion_summary"
+} else {
+    fir_log "WARNING: Initial numeric congestion summary was not generated"
+}
 
-# PASS 2: normal global routing. The resulting guides feed detailed_route.
+# The main process has never run the diagnostic route, so its database is
+# still at the saved pre-GRT placement state. No read_db/reset is required.
+# Run the production global route here; its guides feed detailed_route.
 fir_log "FINAL_GLOBAL_ROUTE_STARTED"
 fir_step "global_routing" [list global_route \
     -congestion_report_file $final_congestion_gcell_report \
@@ -259,6 +281,7 @@ puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $final_congestion_status"
 puts $fd "FINAL_GLOBAL_ROUTE_HAS_CONGESTION: $final_congestion_status"
 puts $fd "INITIAL_CONGESTION_SUMMARY: $initial_congestion_summary"
 puts $fd "FINAL_CONGESTION_SUMMARY: $final_congestion_summary"
+puts $fd "INITIAL_CONGESTION_DIAGNOSTIC_LOG: $initial_congestion_log"
 close $fd
 
 # Explicit global-route wirelength report (microns, as reported by OpenROAD).
