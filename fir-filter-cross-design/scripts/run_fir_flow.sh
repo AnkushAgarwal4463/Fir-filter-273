@@ -19,7 +19,10 @@ export UTIL="${UTIL:-40}"
 export CLK_PERIOD="${CLK_PERIOD:-${CLK_PERIOD_NS:-10.0}}"
 export ENABLE_REPAIR_TIMING="${REQUESTED_REPAIR_MODE:-${ENABLE_REPAIR_TIMING:-1}}"
 
-case "$TAPS" in 4|8|12) ;; *) echo "ERROR: TAPS must be 4, 8, or 12."; exit 2 ;; esac
+if ! [[ "$TAPS" =~ ^[0-9]+$ ]] || (( TAPS < 4 || TAPS > 32 || TAPS % 4 != 0 )); then
+    echo "ERROR: TAPS must be a multiple of 4 between 4 and 32."
+    exit 2
+fi
 case "$DATA_WIDTH" in 8|16|24|32|40|48) ;; *) echo "ERROR: DATA_WIDTH must be 8, 16, 24, 32, 40, or 48."; exit 2 ;; esac
 [[ "$COEFF_WIDTH" == 8 ]] || { echo "ERROR: COEFF_WIDTH must be 8."; exit 2; }
 case "$UTIL" in 20|30|40|50|60|70|80) ;; *) echo "ERROR: UTIL must be 20, 30, 40, 50, 60, 70, or 80."; exit 2 ;; esac
