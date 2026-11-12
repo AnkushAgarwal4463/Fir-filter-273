@@ -1,17 +1,19 @@
-
 # FIR physical-design flow for OpenROAD / Sky130HD.
 #
 # Required environment:
 # TECH_LEF, CELL_LEF, LIBERTY, NETLIST, SDC, RUN_DIR,
-# UTIL (percent), PLACE_DENSITY (0..1)
+# UTIL (requested utilization, percent), FLOORPLAN_UTIL (effective utilization, percent),
+# PLACE_DENSITY (0..1), CORE_AREA_SCALE
 #
 # Optional environment:
 # RUN_TAG
 # ENABLE_REPAIR_TIMING (0 = disabled, 1 = enabled; default = 1)
 #
 # IMPORTANT DATASET POLICY:
-# Synthesized-netlist features are the only ML predictors.
-# Placement/routing measurements, including congestion, are labels/targets only.
+# Synthesized-netlist features are the only circuit predictors.
+# Placement/routing measurements and floorplan constraints are kept separately.
+# Floorplan constraints such as effective utilization / placement density must be
+# recorded as known pre-placement conditions, not confused with netlist features.
 
 # ------------------------------------------------------------
 # 1. Validate required environment variables
@@ -19,12 +21,36 @@
 
 foreach var {
     TECH_LEF CELL_LEF LIBERTY NETLIST SDC
-    RUN_DIR UTIL PLACE_DENSITY
+    RUN_DIR UTIL FLOORPLAN_UTIL PLACE_DENSITY CORE_AREA_SCALE
 } {
     if {![info exists ::env($var)] || $::env($var) eq ""} {
         puts stderr "ERROR: required environment variable $var is not set"
         exit 1
     }
+}
+
+foreach var {UTIL FLOORPLAN_UTIL PLACE_DENSITY CORE_AREA_SCALE} {
+    if {![string is double -strict $::env($var)]} {
+        puts stderr "ERROR: $var must be numeric"
+        exit 1
+    }
+}
+
+if {$::env(UTIL) <= 0 || $::env(UTIL) > 80} {
+    puts stderr "ERROR: UTIL must be > 0 and <= 80 percent"
+    exit 1
+}
+if {$::env(FLOORPLAN_UTIL) <= 0 || $::env(FLOORPLAN_UTIL) > 80} {
+    puts stderr "ERROR: FLOORPLAN_UTIL must be > 0 and <= 80 percent"
+    exit 1
+}
+if {$::env(PLACE_DENSITY) <= 0 || $::env(PLACE_DENSITY) > 1} {
+    puts stderr "ERROR: PLACE_DENSITY must be > 0 and <= 1"
+    exit 1
+}
+if {$::env(CORE_AREA_SCALE) < 0.60 || $::env(CORE_AREA_SCALE) > 1.00} {
+    puts stderr "ERROR: CORE_AREA_SCALE must be between 0.60 and 1.00"
+    exit 1
 }
 
 set enable_repair_timing 1
@@ -106,7 +132,11 @@ close $fd
 fir_status "STARTED" "initialization"
 fir_log "RUN_ID: $::fir_run_id"
 fir_log "ENABLE_REPAIR_TIMING: $enable_repair_timing"
-fir_log "ML_INPUT_POLICY: synthesized netlist features only; physical metrics are targets"
+fir_log "REQUESTED_UTILIZATION: $::env(UTIL)"
+fir_log "CORE_AREA_SCALE: $::env(CORE_AREA_SCALE)"
+fir_log "EFFECTIVE_FLOORPLAN_UTILIZATION: $::env(FLOORPLAN_UTIL)"
+fir_log "PLACEMENT_DENSITY: $::env(PLACE_DENSITY)"
+fir_log "ML_INPUT_POLICY: synthesized-netlist features are circuit predictors; physical metrics are targets"
 
 # ------------------------------------------------------------
 # 5. Read technology and design
@@ -124,7 +154,7 @@ fir_step "read_sdc" [list read_sdc $::env(SDC)]
 # ------------------------------------------------------------
 
 fir_step "initialize_floorplan" [list initialize_floorplan \
-    -utilization $::env(UTIL) \
+    -utilization $::env(FLOORPLAN_UTIL) \
     -aspect_ratio 1.0 \
     -core_space 5.0 \
     -site unithd]
