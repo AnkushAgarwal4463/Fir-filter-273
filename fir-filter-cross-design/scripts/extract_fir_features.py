@@ -1309,8 +1309,8 @@ def main() -> int:
     outdir = Path(args.outdir) if args.outdir else run_dir
     netlist_path = Path(args.netlist_json)
 
-    if args.taps not in {4, 8, 12}:
-        parser.error("--taps must be one of: 4, 8, 12.")
+    if args.taps < 4 or args.taps > 32 or args.taps % 4 != 0:
+        parser.error("--taps must be a multiple of 4 between 4 and 32.")
     if args.data_width not in {8, 16, 24, 32, 40, 48}:
         parser.error("--data-width must be one of: 8, 16, 24, 32, 40, 48.")
     if args.coeff_width != 8:
