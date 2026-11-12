@@ -8,20 +8,53 @@ on:
         description: "Choose full sweep or single configuration"
         required: true
         type: choice
-        options: [sweep, single]
+        options:
+          - sweep
+          - single
         default: sweep
+
       taps:
         description: "FIR taps (single mode)"
         required: true
+        type: choice
+        options:
+          - "4"
+          - "8"
+          - "12"
+          - "16"
+          - "20"
+          - "24"
+          - "28"
+          - "32"
         default: "8"
+
       data_width:
         description: "Data width (single mode)"
         required: true
+        type: choice
+        options:
+          - "8"
+          - "16"
+          - "24"
+          - "32"
+          - "40"
+          - "48"
         default: "8"
+
       utilization:
         description: "Target utilization (%) (single mode)"
         required: true
+        type: choice
+        options:
+          - "20"
+          - "30"
+          - "40"
+          - "50"
+          - "60"
+          - "70"
+          - "80"
         default: "40"
+
       clock_period:
         description: "Clock period in ns (single mode)"
         required: true
@@ -36,8 +69,8 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "fir-filter-cross-design/environment.yml"
-      - ".github/workflows/fir.yml"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
 
   pull_request:
     paths:
@@ -48,8 +81,8 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "fir-filter-cross-design/environment.yml"
-      - ".github/workflows/fir.yml"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
 
 permissions:
   contents: read
@@ -73,7 +106,7 @@ env:
 jobs:
 
   # --------------------------------------------------
-  # PREFLIGHT
+  # PREFLIGHT AND CONFIGURATION MATRIX
   # --------------------------------------------------
 
   preflight:
@@ -96,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -s environment.yml
+          test -f ../environment.yml
 
           files=(
             Makefile
@@ -122,7 +155,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
+          environment-file: ${{ github.workspace }}/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
@@ -160,68 +193,79 @@ jobs:
 
           python - <<'PY'
           import json
+          import math
           import os
 
           mode = os.environ["MODE"]
 
+          allowed_taps = (4, 8, 12, 16, 20, 24, 28, 32)
+          allowed_widths = (8, 16, 24, 32, 40, 48)
+          allowed_utils = (20, 30, 40, 50, 60, 70, 80)
+
           periods = (5.0, 7.5, 10.0)
+
+          def validate(taps, width, util, clock):
+              if taps not in allowed_taps:
+                  raise SystemExit(f"Unsupported TAPS: {taps}")
+
+              if width not in allowed_widths:
+                  raise SystemExit(f"Unsupported DATA_WIDTH: {width}")
+
+              if util not in allowed_utils:
+                  raise SystemExit(f"Unsupported UTILIZATION: {util}")
+
+              if not math.isfinite(clock) or clock <= 0:
+                  raise SystemExit("Clock period must be positive.")
+
+          configs = []
 
           if mode == "single":
 
-              selected_period = float(
-                  os.environ["SINGLE_CLOCK_PERIOD"]
-              )
+              taps = int(os.environ["TAPS"])
+              width = int(os.environ["DATA_WIDTH"])
+              util = int(os.environ["UTILIZATION"])
+              clock = float(os.environ["SINGLE_CLOCK_PERIOD"])
 
-              if selected_period <= 0:
-                  raise SystemExit(
-                      "Clock period must be greater than zero."
-                  )
+              validate(taps, width, util, clock)
 
-              configs = [{
-                  "taps": int(os.environ["TAPS"]),
-                  "data_width": int(os.environ["DATA_WIDTH"]),
-                  "utilization": int(os.environ["UTILIZATION"]),
-                  "clock_period": selected_period,
-              }]
+              configs.append({
+                  "taps": taps,
+                  "data_width": width,
+                  "acc_width": width + 8 + 8,
+                  "utilization": util,
+                  "clock_period": clock,
+              })
 
           elif mode == "sweep":
 
-              base = [
-                  (taps, width, util)
-                  for taps, widths in (
-                      (4, (8, 16, 24, 32, 40, 48)),
-                      (8, (8, 16, 24, 32, 40, 48)),
-                      (12, (8,))
-                  )
-                  for width in widths
-                  for util in (20, 30, 40, 50, 60, 70, 80)
-              ]
+              # Eight tap counts x two data widths
+              # x seven utilization values x three clocks.
+              for taps in allowed_taps:
+                  for width in (8, 16):
+                      for util in allowed_utils:
+                          for clock in periods:
 
-              if len(base) != 91:
+                              validate(taps, width, util, clock)
+
+                              configs.append({
+                                  "taps": taps,
+                                  "data_width": width,
+
+                                  # Preserve the existing shell-script
+                                  # accumulator-width convention.
+                                  "acc_width": width + 8 + 8,
+
+                                  "utilization": util,
+                                  "clock_period": clock,
+                              })
+
+              if len(configs) != 336:
                   raise SystemExit(
-                      f"Expected 91 base configurations, got {len(base)}"
+                      f"Expected 336 configurations, got {len(configs)}"
                   )
-
-              configs = [
-                  {
-                      "taps": taps,
-                      "data_width": width,
-                      "utilization": util,
-                      "clock_period": period,
-                  }
-                  for taps, width, util in base
-                  for period in periods
-              ]
 
           else:
-              raise SystemExit(
-                  f"Unsupported RUN_MODE: {mode}"
-              )
-
-          if mode == "sweep" and len(configs) != 273:
-              raise SystemExit(
-                  f"Expected 273 configurations, got {len(configs)}"
-              )
+              raise SystemExit(f"Unsupported RUN_MODE: {mode}")
 
           matrix_json = json.dumps(
               {"include": configs},
@@ -233,12 +277,11 @@ jobs:
               "a",
               encoding="utf-8"
           ) as out:
-
               out.write(f"configurations={matrix_json}\n")
               out.write(f"expected_count={len(configs)}\n")
 
           print(f"Run mode: {mode}")
-          print(f"Clock periods: {periods}")
+          print(f"Clock periods: {periods if mode == 'sweep' else 'single'}")
           print(f"Number of configurations: {len(configs)}")
           PY
 
@@ -264,6 +307,7 @@ jobs:
       TAPS: ${{ matrix.taps }}
       DATA_WIDTH: ${{ matrix.data_width }}
       COEFF_WIDTH: 8
+      ACC_WIDTH: ${{ matrix.acc_width }}
       UTIL: ${{ matrix.utilization }}
       CLK_PERIOD: ${{ matrix.clock_period }}
 
@@ -278,7 +322,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
+          environment-file: ${{ github.workspace }}/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
@@ -322,11 +366,18 @@ jobs:
 
           echo "TAPS=$TAPS"
           echo "DATA_WIDTH=$DATA_WIDTH"
+          echo "COEFF_WIDTH=$COEFF_WIDTH"
+          echo "ACC_WIDTH=$ACC_WIDTH"
           echo "UTIL=$UTIL"
           echo "CLK_PERIOD=$CLK_PERIOD"
           echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
 
           test "$ENABLE_REPAIR_TIMING" = "0"
+
+          [[ "$TAPS" =~ ^[0-9]+$ ]]
+          (( TAPS >= 4 && TAPS <= 32 && TAPS % 4 == 0 ))
+
+          (( ACC_WIDTH == DATA_WIDTH + COEFF_WIDTH + 8 ))
 
       - name: Run FIR physical-design configuration
         id: physical_flow
@@ -340,6 +391,8 @@ jobs:
           echo "Configuration:"
           echo "TAPS=$TAPS"
           echo "DATA_WIDTH=$DATA_WIDTH"
+          echo "COEFF_WIDTH=$COEFF_WIDTH"
+          echo "ACC_WIDTH=$ACC_WIDTH"
           echo "UTIL=$UTIL"
           echo "CLK_PERIOD=$CLK_PERIOD ns"
           echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
@@ -366,14 +419,13 @@ jobs:
           taps = int(os.environ["TAPS"])
           data_width = int(os.environ["DATA_WIDTH"])
           coeff_width = int(os.environ["COEFF_WIDTH"])
+          acc_width = int(os.environ["ACC_WIDTH"])
           utilization = int(os.environ["UTIL"])
           clock = float(os.environ["CLK_PERIOD"])
 
           repair_mode = os.environ.get(
               "ENABLE_REPAIR_TIMING", "1"
           )
-
-          acc_width = data_width + coeff_width + 8
 
           run_id = (
               f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
@@ -386,7 +438,6 @@ jobs:
           run_dir = Path("fir_project/runs") / run_id
 
           stage = "unknown"
-
           status_csv = run_dir / "fir_features_status.csv"
 
           if status_csv.is_file():
@@ -395,7 +446,6 @@ jobs:
                       newline="",
                       encoding="utf-8-sig"
                   ) as handle:
-
                       rows = list(csv.DictReader(handle))
 
                   if rows:
@@ -506,30 +556,24 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: fir-config-*
-          path: ${{ github.workspace }}/fir-filter-cross-design/artifacts
+          path: fir-filter-cross-design/artifacts
           merge-multiple: false
-          if-no-artifact-found: warn
+          if-no-artifact-found: error
 
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
-      
-          ARTIFACT_DIR="$GITHUB_WORKSPACE/fir-filter-cross-design/artifacts"
 
-          echo "Artifact directory: $ARTIFACT_DIR"
-          mkdir -p "$ARTIFACT_DIR"
+          echo "Downloaded artifacts:"
 
-          echo "Downloaded artifact files:"
-          find "$ARTIFACT_DIR" -type f -print | sed -n '1,100p'
-
-          FILE_COUNT="$(find "$ARTIFACT_DIR" -type f | wc -l)"
-          echo "Downloaded file count: $FILE_COUNT"
-
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: No fir-config-* artifacts were downloaded."
-            echo "Check the matrix upload steps and their artifact names/paths."
+          if [ -d artifacts ]; then
+            find artifacts -type f -print | sed -n '1,50p'
+          else
+            echo "ERROR: artifacts directory not found"
             exit 1
           fi
+
+          test -d artifacts
 
       - name: Build combined CSV
         env:
@@ -545,7 +589,7 @@ jobs:
           test -s scripts/combine_fir_results.py
 
           python3 scripts/combine_fir_results.py \
-            --artifacts "$GITHUB_WORKSPACE/fir-filter-cross-design/artifacts" \
+            --artifacts artifacts \
             --output combined_fir_features.csv \
             --run-mode "$RUN_MODE" \
             --single-taps "$SINGLE_TAPS" \
