@@ -69,7 +69,7 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "environment.yml"
+      - "fir-filter-cross-design/environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
   pull_request:
@@ -81,7 +81,7 @@ on:
       - "fir-filter-cross-design/config/**"
       - "fir-filter-cross-design/Makefile"
       - "fir-filter-cross-design/README.md"
-      - "environment.yml"
+      - "fir-filter-cross-design/environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
 permissions:
@@ -129,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -f ../environment.yml
+          test -s environment.yml
 
           files=(
             Makefile
@@ -155,7 +155,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/environment.yml
+          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
@@ -250,11 +250,7 @@ jobs:
                               configs.append({
                                   "taps": taps,
                                   "data_width": width,
-
-                                  # Preserve the existing shell-script
-                                  # accumulator-width convention.
                                   "acc_width": width + 8 + 8,
-
                                   "utilization": util,
                                   "clock_period": clock,
                               })
@@ -322,7 +318,7 @@ jobs:
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/environment.yml
+          environment-file: ${{ github.workspace }}/fir-filter-cross-design/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
