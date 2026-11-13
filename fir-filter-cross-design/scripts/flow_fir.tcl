@@ -285,6 +285,8 @@ if {[file exists $initial_congestion_summary]} {
 # Run the production global route here; its guides feed detailed_route.
 fir_log "FINAL_GLOBAL_ROUTE_STARTED"
 fir_step "global_routing" [list global_route \
+    -congestion_iterations 50 \
+    -allow_congestion \
     -congestion_report_file $final_congestion_gcell_report \
     -verbose]
 
