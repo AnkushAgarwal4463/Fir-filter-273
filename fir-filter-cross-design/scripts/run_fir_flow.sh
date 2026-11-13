@@ -24,13 +24,13 @@ export CORE_AREA_SCALE="${CORE_AREA_SCALE:-0.7}"
 export FLOORPLAN_MODE="${FLOORPLAN_MODE:-utilization}"
 
 # Fixed floorplan dimensions (microns)
-export DIE_WIDTH="${DIE_WIDTH:-250}"
-export DIE_HEIGHT="${DIE_HEIGHT:-250}"
+export DIE_WIDTH="${DIE_WIDTH:-240}"
+export DIE_HEIGHT="${DIE_HEIGHT:-240}"
 
 export CORE_LL_X="${CORE_LL_X:-5}"
 export CORE_LL_Y="${CORE_LL_Y:-5}"
-export CORE_UR_X="${CORE_UR_X:-245}"
-export CORE_UR_Y="${CORE_UR_Y:-245}"
+export CORE_UR_X="${CORE_UR_X:-235}"
+export CORE_UR_Y="${CORE_UR_Y:-235}"
 
 # Global-placement target for fixed-area mode
 export FIXED_PLACE_DENSITY="${FIXED_PLACE_DENSITY:-0.80}"
