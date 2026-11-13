@@ -120,6 +120,7 @@ export RUN_DIR="fir_project/runs/${RUN_TAG}"
 SYNTH_TAG="t${TAPS}_dw${DATA_WIDTH}_cw${COEFF_WIDTH}_aw${ACC_WIDTH}"
 export NETLIST="fir_project/synth/fir_filter_${SYNTH_TAG}.v"
 export NETLIST_JSON="fir_project/synth/fir_filter_${SYNTH_TAG}.json"
+export SYNTH_METADATA="fir_project/synth/fir_filter_${SYNTH_TAG}_metadata.json"
 
 # SDC is run-specific because it belongs with the run's artifacts.
 export SDC="fir_project/synth/fir_filter_${RUN_TAG}.sdc"
@@ -168,8 +169,13 @@ done
 
 mkdir -p fir_project/synth
 
-# A fresh run directory is created for each floorplan scale.
-rm -rf "$RUN_DIR"
+# Never overwrite an existing experiment.
+if [[ -e "$RUN_DIR" ]]; then
+    echo "ERROR: Run directory already exists: $RUN_DIR"
+    echo "Use a new experiment configuration or archive the previous run."
+    exit 2
+fi
+
 mkdir -p "$RUN_DIR"
 
 # Do not delete NETLIST or NETLIST_JSON here: they may be reused.
@@ -197,8 +203,9 @@ data = {
     "coeff_width": int(os.environ["COEFF_WIDTH"]),
     "acc_width": int(os.environ["ACC_WIDTH"]),
     "requested_utilization": int(os.environ["UTIL"]),
-    "utilization": float(os.environ["FLOORPLAN_UTIL"]),
-    "floorplan_utilization": float(os.environ["FLOORPLAN_UTIL"]),
+    "utilization": float(os.environ["UTIL"]),
+    "requested_utilization_percent": float(os.environ["UTIL"]),
+    "floorplan_utilization_percent": float(os.environ["FLOORPLAN_UTIL"]),
     "core_area_scale": float(os.environ["CORE_AREA_SCALE"]),
     "place_density": float(os.environ["PLACE_DENSITY"]),
     "clock_period": period,
@@ -206,6 +213,9 @@ data = {
     "frequency_mhz": 1000.0 / period,
     "enable_repair_timing": repair,
     "repair_timing_mode": "enabled" if repair else "disabled_diagnostic",
+    "netlist_verilog": os.environ["NETLIST"],
+    "netlist_json": os.environ["NETLIST_JSON"],
+    "sdc_file": os.environ["SDC"],
 }
 
 Path(sys.argv[1]).write_text(
@@ -247,18 +257,60 @@ Path("fir_project/synth/synth_fir.generated.ys").write_text(
     encoding="utf-8"
 )
 PY
-
 # ------------------------------------------------------------
 # 5. Synthesize only when reusable netlist artifacts are absent
+#    or synthesis metadata does not match.
 # ------------------------------------------------------------
 
-if [[ ! -s "$NETLIST" || ! -s "$NETLIST_JSON" ]]; then
-    echo "Synthesized netlist not found. Running Yosys synthesis."
+REUSE_NETLIST=0
+
+if [[ -s "$NETLIST" && -s "$NETLIST_JSON" && -s "$SYNTH_METADATA" ]]; then
+    if python3 - "$SYNTH_METADATA" "$LIBERTY" "$DESIGN_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata = json.loads(Path(sys.argv[1]).read_text())
+
+valid = (
+    metadata.get("design_id") == sys.argv[3]
+    and metadata.get("liberty") == str(Path(sys.argv[2]).resolve())
+)
+
+sys.exit(0 if valid else 1)
+PY
+    then
+        REUSE_NETLIST=1
+    fi
+fi
+
+if [[ "$REUSE_NETLIST" -eq 1 ]]; then
+    echo "Reusing validated synthesized netlist."
+else
+    echo "Netlist missing or synthesis metadata mismatch. Running Yosys."
+
+    rm -f "$NETLIST" "$NETLIST_JSON" "$SYNTH_METADATA"
+
     yosys -l "$RUN_DIR/synthesis.log" \
         -s fir_project/synth/synth_fir.generated.ys
-else
-    echo "Reusing existing synthesized netlist: $NETLIST"
-    echo "Reusing existing synthesized JSON: $NETLIST_JSON"
+
+    [[ -s "$NETLIST" && -s "$NETLIST_JSON" ]] || {
+        echo "ERROR: Synthesis outputs missing."
+        exit 3
+    }
+
+    python3 - "$SYNTH_METADATA" "$LIBERTY" "$DESIGN_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata = {
+    "design_id": sys.argv[3],
+    "liberty": str(Path(sys.argv[2]).resolve())
+}
+
+Path(sys.argv[1]).write_text(json.dumps(metadata, indent=2) + "\n")
+PY
 fi
 
 for file in "$NETLIST" "$NETLIST_JSON"; do
@@ -347,7 +399,7 @@ if python3 scripts/extract_fir_features.py \
     --data-width "$DATA_WIDTH" \
     --coeff-width "$COEFF_WIDTH" \
     --acc-width "$ACC_WIDTH" \
-    --utilization "$FLOORPLAN_UTIL" \
+    --utilization "$UTIL" \
     --place-density "$PLACE_DENSITY" \
     --clock-period "$CLK_PERIOD"; then
     echo "Feature extraction completed."
