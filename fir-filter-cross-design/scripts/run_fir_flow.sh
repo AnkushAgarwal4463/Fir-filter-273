@@ -17,7 +17,7 @@ export ACC_WIDTH="${ACC_WIDTH:-$((DATA_WIDTH + COEFF_WIDTH + 8))}"
 export UTIL="${UTIL:-40}"
 export CLK_PERIOD="${CLK_PERIOD:-${CLK_PERIOD_NS:-10.0}}"
 export ENABLE_REPAIR_TIMING="${ENABLE_REPAIR_TIMING:-1}"
-export CORE_AREA_SCALE="${CORE_AREA_SCALE:-1.0}"
+export CORE_AREA_SCALE="${CORE_AREA_SCALE:-0.5}"
 
 # ------------------------------------------------------------
 # 1. Validate design and experiment parameters
