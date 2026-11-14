@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Extract FIR synthesis features and OpenROAD physical targets.
 
@@ -9,11 +8,28 @@ Dataset outputs:
     physical_targets.csv/.json       - placement/routing targets
     features.csv/.json               - combined inspection dataset
     fir_features.csv                 - FIR configuration and flow status
+    grt_sweep_summary.csv            - per-capacity GRT results (if a sweep ran)
     extraction_status.json           - extraction diagnostics
     run_report.md                    - human-readable report
     fir_feature_report.xlsx          - optional Excel workbook
 
 Unavailable measurements remain null. No physical result is fabricated.
+
+Changes in this version:
+  * Actual die/core geometry is measured from the DEF (DIEAREA and ROWs), so
+    geometry fields are no longer null in utilization mode, and requested vs
+    actual core area can be compared.
+  * Flow-diagnostics values (netlist area, core utilization, placement density
+    actually used) are read from flow_diagnostics.log.
+  * GRT overflow aliases (grt_total_overflow, grt_max_*_overflow) and
+    grt_has_overflow flags were added. In the OpenROAD GRT table the last
+    column group is "Max H / Max V / Total Overflow", so the existing
+    *_congestion fields are overflow values.
+  * Initial congestion falls back to initial_congestion_openroad.log when the
+    report_congestion summary has no table.
+  * Capacity-sweep logs in grt_sweep/ are summarized and are excluded from the
+    generic log scan so they cannot contaminate other measurements.
+  * configuration_manifest_found now reflects whether the manifest exists.
 """
 
 from __future__ import annotations
@@ -46,6 +62,8 @@ COMB_RE = re.compile(
     r"(?:and|or|xor|xnor|mux|maj|fa|ha|aoi|oai|nand|nor|add|sub|mul|alu|logic|cmp)",
     re.I,
 )
+
+GRT_LAYERS = ("li1", "met1", "met2", "met3", "met4", "met5")
 
 
 # ---------------------------------------------------------------------------
@@ -145,14 +163,26 @@ def safe_relative_path(path: Path, base: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def collect_logs(run_dir: Path) -> dict[str, str]:
-    """Collect .log/.txt files recursively, including nested OpenROAD logs."""
+    """Collect .log/.txt files recursively, including nested OpenROAD logs.
+
+    The grt_sweep/ directory is excluded: its logs describe additional
+    capacity-derated routing experiments, not the production run.
+    """
     if not run_dir.is_dir():
         return {}
+
+    def is_sweep_file(path: Path) -> bool:
+        try:
+            return "grt_sweep" in path.relative_to(run_dir).parts
+        except ValueError:
+            return False
 
     paths = sorted(
         path
         for path in run_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".log", ".txt"}
+        if path.is_file()
+        and path.suffix.lower() in {".log", ".txt"}
+        and not is_sweep_file(path)
     )
 
     priority = {
@@ -444,6 +474,189 @@ def load_lef_sizes(
                     )
 
     return macros, sites
+
+
+# ---------------------------------------------------------------------------
+# Actual floorplan geometry from the DEF (new)
+# ---------------------------------------------------------------------------
+
+GEOMETRY_KEYS = (
+    "die_ll_x_um",
+    "die_ll_y_um",
+    "die_ur_x_um",
+    "die_ur_y_um",
+    "die_width_um",
+    "die_height_um",
+    "die_area_um2",
+    "core_ll_x_um",
+    "core_ll_y_um",
+    "core_ur_x_um",
+    "core_ur_y_um",
+    "core_width_um",
+    "core_height_um",
+    "core_area_um2",
+    "core_row_count",
+)
+
+
+def parse_def_geometry(def_text: str) -> dict[str, Any]:
+    """Measure the real die and core from a DEF file.
+
+    Die: DIEAREA rectangle.
+    Core: union extent of all ROW statements (the placeable region).
+    All lengths are converted from DEF database units to microns.
+    Anything that cannot be measured stays None.
+    """
+    result: dict[str, Any] = {key: None for key in GEOMETRY_KEYS}
+
+    if not def_text or not def_text.strip():
+        return result
+
+    units = re.search(
+        r"\bUNITS\s+DISTANCE\s+MICRONS\s+(\d+)\s*;",
+        def_text,
+        re.I,
+    )
+
+    dbu = finite_float(units.group(1)) if units else None
+
+    if not dbu or dbu <= 0:
+        return result
+
+    die = re.search(
+        rf"\bDIEAREA\s*\(\s*({NUM})\s+({NUM})\s*\)\s*"
+        rf"\(\s*({NUM})\s+({NUM})\s*\)",
+        def_text,
+        re.I,
+    )
+
+    if die:
+        x1, y1, x2, y2 = (float(die.group(i)) / dbu for i in range(1, 5))
+
+        if x2 > x1 and y2 > y1:
+            result.update({
+                "die_ll_x_um": x1,
+                "die_ll_y_um": y1,
+                "die_ur_x_um": x2,
+                "die_ur_y_um": y2,
+                "die_width_um": x2 - x1,
+                "die_height_um": y2 - y1,
+                "die_area_um2": (x2 - x1) * (y2 - y1),
+            })
+
+    _, sites = load_lef_sizes([
+        configured_path("TECH_LEF"),
+        configured_path("CELL_LEF"),
+    ])
+
+    row_pattern = re.compile(
+        rf"(?mi)^\s*ROW\s+\S+\s+(\S+)\s+({NUM})\s+({NUM})\s+\S+\s+"
+        rf"DO\s+(\d+)\s+BY\s+(\d+)\s+STEP\s+({NUM})\s+({NUM})\s*;"
+    )
+
+    rows = []
+
+    for match in row_pattern.finditer(def_text):
+        rows.append({
+            "site": match.group(1),
+            "ox": float(match.group(2)),
+            "oy": float(match.group(3)),
+            "nx": int(match.group(4)),
+            "ny": int(match.group(5)),
+            "sx": float(match.group(6)),
+            "sy": float(match.group(7)),
+        })
+
+    if not rows:
+        return result
+
+    ys = sorted({row["oy"] for row in rows})
+    gaps = [b - a for a, b in zip(ys, ys[1:]) if b > a]
+    row_pitch = min(gaps) if gaps else None
+
+    x_lo: list[float] = []
+    y_lo: list[float] = []
+    x_hi: list[float] = []
+    y_hi: list[float] = []
+    heights_known = True
+
+    for row in rows:
+        dims = sites.get(row["site"])
+
+        site_w = dims[0] * dbu if dims else row["sx"]
+        site_h = dims[1] * dbu if dims else row_pitch
+
+        step_x = row["sx"] if row["sx"] > 0 else site_w
+
+        x_lo.append(row["ox"])
+        x_hi.append(row["ox"] + max(row["nx"] - 1, 0) * step_x + site_w)
+        y_lo.append(row["oy"])
+
+        if site_h is None or site_h <= 0:
+            heights_known = False
+            continue
+
+        step_y = row["sy"] if row["sy"] > 0 else site_h
+        y_hi.append(row["oy"] + max(row["ny"] - 1, 0) * step_y + site_h)
+
+    result["core_row_count"] = len(rows)
+
+    core_ll_x = min(x_lo) / dbu
+    core_ll_y = min(y_lo) / dbu
+    core_ur_x = max(x_hi) / dbu
+
+    result.update({
+        "core_ll_x_um": core_ll_x,
+        "core_ll_y_um": core_ll_y,
+        "core_ur_x_um": core_ur_x,
+        "core_width_um": core_ur_x - core_ll_x,
+    })
+
+    if heights_known and y_hi:
+        core_ur_y = max(y_hi) / dbu
+
+        result.update({
+            "core_ur_y_um": core_ur_y,
+            "core_height_um": core_ur_y - core_ll_y,
+            "core_area_um2": (core_ur_x - core_ll_x) * (core_ur_y - core_ll_y),
+        })
+
+    return result
+
+
+def read_geometry_def(run_dir: Path) -> tuple[str | None, str]:
+    """Return (file name, text) of the best DEF available for geometry."""
+    for name in ("final.def", "pre_drt.def"):
+        text = read_text(run_dir / name)
+
+        if text.strip():
+            return name, text
+
+    return None, ""
+
+
+def parse_flow_diagnostics(run_dir: Path) -> dict[str, Any]:
+    """Read values the Tcl flow logged in flow_diagnostics.log."""
+    text = read_text(run_dir / "flow_diagnostics.log")
+
+    return {
+        "netlist_area_um2": last_number(
+            text,
+            [rf"^PRE_PLACEMENT_NETLIST_AREA_UM2:\s*({NUM})"],
+        ),
+        "floorplan_core_area_um2": last_number(
+            text,
+            [rf"^CORE_AREA_UM2_ACTUAL:\s*({NUM})"],
+        ),
+        "core_utilization_netlist_percent": last_number(
+            text,
+            [rf"^PRE_PLACEMENT_CORE_UTILIZATION_PERCENT:\s*({NUM})"],
+        ),
+        "place_density_used": last_number(
+            text,
+            [rf"^PLACEMENT_DENSITY_USED:\s*({NUM})"],
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1174,12 @@ def parse_route_log(text: str) -> dict[str, Any]:
 
 
 def empty_grt_metrics() -> dict[str, float | None]:
-    """Return the stable set of global-routing congestion target fields."""
+    """Return the stable set of global-routing congestion target fields.
+
+    In the OpenROAD GRT table the last column group is
+    "Max H / Max V / Total Overflow", so the *_congestion fields hold overflow
+    values. The *_overflow aliases make that explicit.
+    """
     metrics: dict[str, float | None] = {
         "grt_total_resource": None,
         "grt_total_demand": None,
@@ -969,9 +1187,12 @@ def empty_grt_metrics() -> dict[str, float | None]:
         "grt_max_horizontal_congestion": None,
         "grt_max_vertical_congestion": None,
         "grt_total_congestion": None,
+        "grt_max_horizontal_overflow": None,
+        "grt_max_vertical_overflow": None,
+        "grt_total_overflow": None,
     }
 
-    for layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
+    for layer in GRT_LAYERS:
         for suffix in (
             "resource",
             "demand",
@@ -1035,6 +1256,9 @@ def parse_congestion_metrics(
                 "grt_max_horizontal_congestion": max_h,
                 "grt_max_vertical_congestion": max_v,
                 "grt_total_congestion": total,
+                "grt_max_horizontal_overflow": max_h,
+                "grt_max_vertical_overflow": max_v,
+                "grt_total_overflow": total,
             })
 
             found_total = True
@@ -1053,8 +1277,21 @@ def parse_congestion_metrics(
 
 
 def parse_congestion(text: str) -> float | None:
-    """Compatibility accessor: returns GRT total congestion, not overflow."""
+    """Compatibility accessor: returns GRT total overflow."""
     return parse_congestion_metrics(text)["grt_total_congestion"]
+
+
+def overflow_flag(
+    metrics: dict[str, Any],
+    prefix: str = "",
+) -> bool | None:
+    """True if the parsed GRT table shows positive total overflow."""
+    value = metrics.get(f"{prefix}grt_total_overflow")
+
+    if value is None:
+        return None
+
+    return value > 0
 
 
 def parse_congestion_status(
@@ -1157,6 +1394,79 @@ def read_grt_summary(
         return str(path), empty_grt_metrics()
 
     return str(path), metrics
+
+
+# ---------------------------------------------------------------------------
+# Capacity-sweep summary (new)
+# ---------------------------------------------------------------------------
+
+def _sweep_sort_key(path: Path) -> float:
+    try:
+        return float(path.stem[len("adj_"):])
+    except ValueError:
+        return float("inf")
+
+
+def summarize_grt_sweep(
+    run_dir: Path,
+    outdir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize grt_sweep/adj_*.log into grt_sweep_summary.csv.
+
+    Each row is one global-routing run on the saved pre-GRT placement with a
+    different capacity derating. Values that cannot be parsed stay None.
+    """
+    sweep_dir = run_dir / "grt_sweep"
+
+    if not sweep_dir.is_dir():
+        return []
+
+    rows: list[dict[str, Any]] = []
+
+    for log in sorted(sweep_dir.glob("adj_*.log"), key=_sweep_sort_key):
+        text = read_text(log)
+        metrics = parse_congestion_metrics(text)
+
+        params = re.search(
+            r"SWEEP_PARAMS:\s*adj=(\S+)\s+congestion_iterations=(\d+)\s+"
+            r"layers=(\S+)",
+            text,
+        )
+
+        adj_from_name = _sweep_sort_key(log)
+
+        rows.append({
+            "run_id": run_dir.name,
+            "grt_layer_adjustment": (
+                finite_float(params.group(1))
+                if params
+                else (adj_from_name if math.isfinite(adj_from_name) else None)
+            ),
+            "grt_congestion_iterations": (
+                int(params.group(2)) if params else None
+            ),
+            "grt_routing_layers": params.group(3) if params else None,
+            **metrics,
+            "grt_has_overflow": overflow_flag(metrics),
+            "sweep_log": safe_relative_path(log, run_dir),
+        })
+
+    if rows and outdir is not None:
+        fields: list[str] = []
+
+        for row in rows:
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
+
+        with (outdir / "grt_sweep_summary.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1593,21 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "initial_congestion_summary.rpt",
     )
 
+    # The report_congestion summary may not contain the GRT table. The fresh
+    # diagnostic process log does, so fall back to it.
+    if initial_congestion_raw["grt_total_resource"] is None:
+        initial_log_path = run_dir / "initial_congestion_openroad.log"
+        initial_log_metrics = parse_congestion_metrics(
+            read_text(initial_log_path)
+        )
+
+        if initial_log_metrics["grt_total_resource"] is not None:
+            initial_congestion_raw = initial_log_metrics
+            initial_congestion_source = (
+                f"{initial_log_path} (GRT final congestion report, "
+                f"no rip-up/reroute)"
+            )
+
     initial_congestion_metrics = {
         f"initial_{key}": value
         for key, value in initial_congestion_raw.items()
@@ -1376,6 +1701,14 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "\n".join([area_text, all_logs])
     )
 
+    # report_design_area prints e.g. "Design area 44580 u^2 72% utilization."
+    reported_utilization = last_number(
+        area_text,
+        [
+            rf"\bdesign area\s+{NUM}\s*u\^?2\s+({NUM})\s*%\s*utilization",
+        ],
+    )
+
     lef_path = configured_path("CELL_LEF")
 
     density_measurement = measure_density_from_def(
@@ -1430,6 +1763,12 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         and odb_path.stat().st_size > 0
     )
 
+    grt_has_overflow = overflow_flag(congestion_metrics)
+    initial_grt_has_overflow = overflow_flag(
+        initial_congestion_metrics,
+        "initial_",
+    )
+
     measurements = {
         "wns_setup_ns": (
             "measured" if wns_setup is not None else "unavailable"
@@ -1448,6 +1787,14 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
             key: "measured" if value is not None else "unavailable"
             for key, value in initial_congestion_metrics.items()
         },
+        "grt_has_overflow": (
+            "measured" if grt_has_overflow is not None else "unavailable"
+        ),
+        "initial_grt_has_overflow": (
+            "measured"
+            if initial_grt_has_overflow is not None
+            else "unavailable"
+        ),
         "congestion_status": (
             "measured" if congestion_status is not None else "unavailable"
         ),
@@ -1474,6 +1821,11 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "design_area_um2": (
             "measured"
             if physical["design_area_um2"] is not None
+            else "unavailable"
+        ),
+        "reported_core_utilization_percent": (
+            "measured"
+            if reported_utilization is not None
             else "unavailable"
         ),
         "effective_place_density": (
@@ -1513,11 +1865,14 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
             density_measurement.get("effective_place_density_method")
         ),
         "design_area_um2": physical["design_area_um2"],
+        "reported_core_utilization_percent": reported_utilization,
         "wns_setup_ns": wns_setup,
         "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         **congestion_metrics,
         **initial_congestion_metrics,
+        "grt_has_overflow": grt_has_overflow,
+        "initial_grt_has_overflow": initial_grt_has_overflow,
         "congestion_status": congestion_status,
         "initial_congestion_status": initial_congestion_status,
         "setup_report_source": (
@@ -1549,8 +1904,10 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
             "DEF route counts are approximate. Cell classes are heuristic "
             "and should be validated against Liberty. Fanout uses Yosys "
             "directions with Liberty fallback. Congestion is extracted only "
-            "from a dedicated global-routing report/log. Resource, demand, "
-            "usage and congestion are physical targets, not predictors. "
+            "from a dedicated global-routing report/log. The GRT table's "
+            "last column group is Max H / Max V / Total Overflow, so the "
+            "*_congestion fields are overflow values. Resource, demand, "
+            "usage and overflow are physical targets, not predictors. "
             "Effective density is measured from placed LEF macro area "
             "divided by DEF placement-row area when geometry is available. "
             "Router violations are not independent signoff DRC."
@@ -1739,13 +2096,26 @@ def validate_configuration(
 def extract_run_conditions(
     args: argparse.Namespace,
     manifest: dict[str, Any] | None,
+    def_geometry: dict[str, Any] | None = None,
+    geometry_source: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract pre-placement run conditions and floorplan geometry.
 
     Supports both fixed-area and utilization-derived floorplans.
     Requested utilization is null for fixed-area runs.
+
+    Geometry fields (die_*, core_*) hold the ACTUAL values measured from the
+    DEF whenever one is available, and fall back to the requested values in
+    configuration.json otherwise. requested_core_area_um2 and
+    core_area_vs_requested_percent make requested-vs-actual comparison
+    explicit, so a floorplan that silently ignored the requested size is
+    visible in the data.
     """
+    manifest_present = manifest is not None
     manifest = manifest or {}
+    def_geometry = def_geometry or {}
+    diagnostics = diagnostics or {}
 
     mode = str(
         first_manifest_value(
@@ -1784,69 +2154,106 @@ def extract_run_conditions(
             ("core_area_scale",),
         )
 
-    die_width = manifest_number(
-        manifest,
-        ("die_width_um", "die_width"),
+    def pick(actual_key: str, requested: float | None) -> float | None:
+        actual = def_geometry.get(actual_key)
+        return actual if actual is not None else requested
+
+    requested_die_width = manifest_number(
+        manifest, ("die_width_um", "die_width"),
+    )
+    requested_die_height = manifest_number(
+        manifest, ("die_height_um", "die_height"),
+    )
+    requested_ll_x = manifest_number(
+        manifest, ("core_ll_x_um", "core_ll_x"),
+    )
+    requested_ll_y = manifest_number(
+        manifest, ("core_ll_y_um", "core_ll_y"),
+    )
+    requested_ur_x = manifest_number(
+        manifest, ("core_ur_x_um", "core_ur_x"),
+    )
+    requested_ur_y = manifest_number(
+        manifest, ("core_ur_y_um", "core_ur_y"),
     )
 
-    die_height = manifest_number(
-        manifest,
-        ("die_height_um", "die_height"),
-    )
-
-    core_ll_x = manifest_number(
-        manifest,
-        ("core_ll_x_um", "core_ll_x"),
-    )
-
-    core_ll_y = manifest_number(
-        manifest,
-        ("core_ll_y_um", "core_ll_y"),
-    )
-
-    core_ur_x = manifest_number(
-        manifest,
-        ("core_ur_x_um", "core_ur_x"),
-    )
-
-    core_ur_y = manifest_number(
-        manifest,
-        ("core_ur_y_um", "core_ur_y"),
-    )
-
-    core_width = (
-        core_ur_x - core_ll_x
+    requested_core_width = (
+        requested_ur_x - requested_ll_x
         if (
-            core_ur_x is not None
-            and core_ll_x is not None
-            and core_ur_x > core_ll_x
+            requested_ur_x is not None
+            and requested_ll_x is not None
+            and requested_ur_x > requested_ll_x
         )
         else None
     )
 
-    core_height = (
-        core_ur_y - core_ll_y
+    requested_core_height = (
+        requested_ur_y - requested_ll_y
         if (
-            core_ur_y is not None
-            and core_ll_y is not None
-            and core_ur_y > core_ll_y
+            requested_ur_y is not None
+            and requested_ll_y is not None
+            and requested_ur_y > requested_ll_y
         )
         else None
     )
 
-    calculated_core_area = (
-        core_width * core_height
-        if core_width is not None and core_height is not None
-        else None
-    )
-
-    recorded_core_area = manifest_number(
+    requested_core_area = manifest_number(
         manifest,
         ("core_area_um2",),
     )
 
-    if recorded_core_area is None:
-        recorded_core_area = calculated_core_area
+    if (
+        requested_core_area is None
+        and requested_core_width is not None
+        and requested_core_height is not None
+    ):
+        requested_core_area = requested_core_width * requested_core_height
+
+    die_width = pick("die_width_um", requested_die_width)
+    die_height = pick("die_height_um", requested_die_height)
+    core_ll_x = pick("core_ll_x_um", requested_ll_x)
+    core_ll_y = pick("core_ll_y_um", requested_ll_y)
+    core_ur_x = pick("core_ur_x_um", requested_ur_x)
+    core_ur_y = pick("core_ur_y_um", requested_ur_y)
+    core_width = pick("core_width_um", requested_core_width)
+    core_height = pick("core_height_um", requested_core_height)
+
+    actual_core_area = def_geometry.get("core_area_um2")
+    core_area = (
+        actual_core_area
+        if actual_core_area is not None
+        else requested_core_area
+    )
+
+    if actual_core_area is not None:
+        source = geometry_source or "DEF"
+    elif requested_core_area is not None:
+        source = "configuration.json (requested; DEF geometry unavailable)"
+    else:
+        source = None
+
+    core_vs_requested = (
+        100.0 * (actual_core_area - requested_core_area) / requested_core_area
+        if (
+            actual_core_area is not None
+            and requested_core_area is not None
+            and requested_core_area > 0
+        )
+        else None
+    )
+
+    # Utilization of the actual core by the synthesized netlist, measured
+    # before placement. Prefer the value the Tcl flow measured directly.
+    netlist_area = diagnostics.get("netlist_area_um2")
+    core_util_percent = diagnostics.get("core_utilization_netlist_percent")
+
+    if (
+        core_util_percent is None
+        and netlist_area is not None
+        and core_area is not None
+        and core_area > 0
+    ):
+        core_util_percent = 100.0 * netlist_area / core_area
 
     return {
         "run_id": args.run_id or "",
@@ -1856,7 +2263,13 @@ def extract_run_conditions(
         "floorplan_utilization_percent": floorplan_utilization,
         "core_area_scale": core_area_scale,
         "place_density_target": args.place_density,
+        "place_density_used": diagnostics.get("place_density_used"),
         "clock_period_ns": args.clock_period,
+        "route_min_layer": manifest.get("route_min_layer"),
+        "route_max_layer": manifest.get("route_max_layer"),
+        "grt_layer_adjustment": manifest_number(
+            manifest, ("grt_layer_adjustment",),
+        ),
         "die_width_um": die_width,
         "die_height_um": die_height,
         "die_area_um2": (
@@ -1870,11 +2283,16 @@ def extract_run_conditions(
         "core_ur_y_um": core_ur_y,
         "core_width_um": core_width,
         "core_height_um": core_height,
-        "core_area_um2": recorded_core_area,
+        "core_area_um2": core_area,
+        "requested_core_area_um2": requested_core_area,
+        "core_area_vs_requested_percent": core_vs_requested,
+        "geometry_source": source,
+        "netlist_area_um2": netlist_area,
+        "core_utilization_netlist_percent": core_util_percent,
         "fixed_place_density_target": (
             args.place_density if mode == "fixed" else None
         ),
-        "configuration_manifest_found": manifest is not None,
+        "configuration_manifest_found": manifest_present,
     }
 
 
@@ -2000,8 +2418,14 @@ def write_configuration_csv(
         "floorplan_utilization_percent",
         "core_area_scale",
         "place_density_target",
+        "place_density_used",
         "clock_period_ns",
+        "route_min_layer",
+        "route_max_layer",
+        "grt_layer_adjustment",
         "core_area_um2",
+        "requested_core_area_um2",
+        "geometry_source",
         "die_width_um",
         "die_height_um",
         "core_ll_x_um",
@@ -2015,30 +2439,17 @@ def write_configuration_csv(
     row = {
         "run_id": run_id,
         "design_id": args.design_id,
-        "floorplan_mode": conditions["floorplan_mode"],
         "taps": args.taps,
         "data_width": args.data_width,
         "coeff_width": args.coeff_width,
         "acc_width": args.acc_width,
-        "requested_utilization_percent": (
-            conditions["requested_utilization_percent"]
-        ),
-        "floorplan_utilization_percent": (
-            conditions["floorplan_utilization_percent"]
-        ),
-        "core_area_scale": conditions["core_area_scale"],
-        "place_density_target": conditions["place_density_target"],
-        "clock_period_ns": conditions["clock_period_ns"],
-        "core_area_um2": conditions["core_area_um2"],
-        "die_width_um": conditions["die_width_um"],
-        "die_height_um": conditions["die_height_um"],
-        "core_ll_x_um": conditions["core_ll_x_um"],
-        "core_ll_y_um": conditions["core_ll_y_um"],
-        "core_ur_x_um": conditions["core_ur_x_um"],
-        "core_ur_y_um": conditions["core_ur_y_um"],
         "flow_status": flow_status,
         "last_completed_stage": last_stage,
     }
+
+    for key in fields:
+        if key not in row:
+            row[key] = conditions.get(key)
 
     write_rows_csv(
         outdir / "fir_features.csv",
@@ -2103,23 +2514,29 @@ DISPLAY_NAMES = {
     "placed_cell_area_from_def_um2": "Placed cell area from DEF (µm²)",
     "placement_row_area_um2": "Placement row area (µm²)",
     "design_area_um2": "Design area (µm²)",
+    "reported_core_utilization_percent": "Reported core utilization (%)",
     "wns_setup_ns": "Setup WNS (ns)",
     "tns_setup_ns": "Setup TNS (ns)",
     "wns_hold_ns": "Hold WNS (ns)",
     "grt_total_resource": "GRT total routing resources",
     "grt_total_demand": "GRT total routing demand",
     "grt_usage_percent": "GRT total resource usage (%)",
-    "grt_max_horizontal_congestion": "GRT maximum horizontal congestion",
-    "grt_max_vertical_congestion": "GRT maximum vertical congestion",
-    "grt_total_congestion": "GRT total congestion",
+    "grt_max_horizontal_congestion": "GRT maximum horizontal overflow",
+    "grt_max_vertical_congestion": "GRT maximum vertical overflow",
+    "grt_total_congestion": "GRT total overflow",
+    "grt_max_horizontal_overflow": "GRT maximum horizontal overflow (alias)",
+    "grt_max_vertical_overflow": "GRT maximum vertical overflow (alias)",
+    "grt_total_overflow": "GRT total overflow (alias)",
+    "grt_has_overflow": "GRT has positive overflow",
+    "initial_grt_has_overflow": "Initial GRT has positive overflow",
     "congestion_status": "Final global-route congestion status",
     "initial_congestion_status": "Initial global-route congestion status",
     "initial_grt_total_resource": "Initial GRT total routing resources",
     "initial_grt_total_demand": "Initial GRT total routing demand",
     "initial_grt_usage_percent": "Initial GRT total resource usage (%)",
-    "initial_grt_max_horizontal_congestion": "Initial GRT maximum horizontal congestion",
-    "initial_grt_max_vertical_congestion": "Initial GRT maximum vertical congestion",
-    "initial_grt_total_congestion": "Initial GRT total congestion",
+    "initial_grt_max_horizontal_congestion": "Initial GRT maximum horizontal overflow",
+    "initial_grt_max_vertical_congestion": "Initial GRT maximum vertical overflow",
+    "initial_grt_total_congestion": "Initial GRT total overflow",
     "setup_report_source": "Setup timing report source",
     "tns_report_source": "TNS report source",
     "hold_report_source": "Hold timing report source",
@@ -2133,9 +2550,13 @@ DISPLAY_NAMES = {
     "requested_utilization_percent": "Requested utilization (%)",
     "floorplan_utilization_percent": "Floorplan utilization (%)",
     "core_area_scale": "Core area scale",
-    "place_density_target": "Placement density target",
+    "place_density_target": "Placement density target (requested)",
+    "place_density_used": "Placement density actually used",
     "fixed_place_density_target": "Fixed-mode placement density target",
     "clock_period_ns": "Clock period (ns)",
+    "route_min_layer": "Lowest routing layer",
+    "route_max_layer": "Highest routing layer",
+    "grt_layer_adjustment": "GRT capacity derating",
     "die_width_um": "Die width (µm)",
     "die_height_um": "Die height (µm)",
     "die_area_um2": "Die area (µm²)",
@@ -2145,7 +2566,12 @@ DISPLAY_NAMES = {
     "core_ur_y_um": "Core upper-right Y (µm)",
     "core_width_um": "Core width (µm)",
     "core_height_um": "Core height (µm)",
-    "core_area_um2": "Core area (µm²)",
+    "core_area_um2": "Core area (µm²) (actual, from DEF when available)",
+    "requested_core_area_um2": "Requested core area (µm²)",
+    "core_area_vs_requested_percent": "Actual vs requested core area (%)",
+    "geometry_source": "Geometry source",
+    "netlist_area_um2": "Synthesized-netlist cell area (µm²)",
+    "core_utilization_netlist_percent": "Netlist area / core area (%)",
     "taps": "FIR taps",
     "data_width": "Data width (bits)",
     "coeff_width": "Coefficient width (bits)",
@@ -2155,19 +2581,19 @@ DISPLAY_NAMES = {
     "configuration_manifest_found": "Configuration manifest found",
 }
 
-for _layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
+for _layer in GRT_LAYERS:
     DISPLAY_NAMES.update({
         f"grt_{_layer}_resource": f"{_layer} routing resources",
         f"grt_{_layer}_demand": f"{_layer} routing demand",
         f"grt_{_layer}_usage_percent": f"{_layer} resource usage (%)",
         f"grt_{_layer}_max_horizontal_congestion": (
-            f"{_layer} max horizontal congestion"
+            f"{_layer} max horizontal overflow"
         ),
         f"grt_{_layer}_max_vertical_congestion": (
-            f"{_layer} max vertical congestion"
+            f"{_layer} max vertical overflow"
         ),
         f"grt_{_layer}_total_congestion": (
-            f"{_layer} total congestion"
+            f"{_layer} total overflow"
         ),
         f"initial_grt_{_layer}_resource": (
             f"Initial {_layer} routing resources"
@@ -2179,13 +2605,13 @@ for _layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
             f"Initial {_layer} resource usage (%)"
         ),
         f"initial_grt_{_layer}_max_horizontal_congestion": (
-            f"Initial {_layer} max horizontal congestion"
+            f"Initial {_layer} max horizontal overflow"
         ),
         f"initial_grt_{_layer}_max_vertical_congestion": (
-            f"Initial {_layer} max vertical congestion"
+            f"Initial {_layer} max vertical overflow"
         ),
         f"initial_grt_{_layer}_total_congestion": (
-            f"Initial {_layer} total congestion"
+            f"Initial {_layer} total overflow"
         ),
     })
 
@@ -2269,6 +2695,7 @@ def write_human_report(
             conditions["floorplan_utilization_percent"],
         ),
         ("Placement density target", conditions["place_density_target"]),
+        ("Placement density used", conditions["place_density_used"]),
         ("Clock period (ns)", conditions["clock_period_ns"]),
         ("Core area (µm²)", conditions["core_area_um2"]),
         ("Die width (µm)", conditions["die_width_um"]),
@@ -2313,6 +2740,7 @@ def write_human_report(
         "placed_cell_area_from_def_um2",
         "placement_row_area_um2",
         "design_area_um2",
+        "reported_core_utilization_percent",
         "wns_setup_ns",
         "tns_setup_ns",
         "wns_hold_ns",
@@ -2321,6 +2749,8 @@ def write_human_report(
             f"initial_{key}"
             for key in empty_grt_metrics().keys()
         ],
+        "grt_has_overflow",
+        "initial_grt_has_overflow",
         "congestion_status",
         "initial_congestion_status",
     ]
@@ -2353,7 +2783,11 @@ def write_human_report(
         "floorplan_utilization_percent",
         "core_area_scale",
         "place_density_target",
+        "place_density_used",
         "clock_period_ns",
+        "route_min_layer",
+        "route_max_layer",
+        "grt_layer_adjustment",
         "die_width_um",
         "die_height_um",
         "die_area_um2",
@@ -2364,6 +2798,11 @@ def write_human_report(
         "core_width_um",
         "core_height_um",
         "core_area_um2",
+        "requested_core_area_um2",
+        "core_area_vs_requested_percent",
+        "geometry_source",
+        "netlist_area_um2",
+        "core_utilization_netlist_percent",
     ]
 
     lines = [
@@ -2432,6 +2871,9 @@ def write_human_report(
         "- Netlist predictors contain synthesized-netlist measurements only.",
         "- Run conditions are stored separately and can be combined deliberately during model training.",
         "- Requested utilization and placement density target are not achieved placement density.",
+        "- Core geometry is measured from the DEF; compare it with the requested core area to confirm the floorplan was applied.",
+        "- GRT overflow is the last column group of the GRT table (Max H / Max V / Total Overflow).",
+        "- GRT capacity derating (grt_layer_adjustment) is an experimental run condition, not a netlist feature.",
         "- Effective density is measured from placed LEF macro area divided by DEF placement-row area when geometry is available.",
         "- Routed-net and route-segment counts parsed from DEF are approximate.",
         "- Cell-type classifications are heuristic and should be validated against Liberty metadata.",
@@ -2448,6 +2890,7 @@ def write_human_report(
         "| `physical_targets.csv` | Physical-design targets |",
         "| `features.csv` | Combined inspection record; not predictor-only |",
         "| `fir_features.csv` | FIR configuration and flow status |",
+        "| `grt_sweep_summary.csv` | Per-capacity GRT results, if a sweep ran |",
         "| `fir_feature_report.xlsx` | Formatted Excel workbook, if available |",
         "| `extraction_status.json` | Extraction diagnostics |",
         "| `run_report.md` | Human-readable report |",
@@ -2516,7 +2959,14 @@ def write_excel_workbook(
             conditions["floorplan_utilization_percent"]
         ),
         "Placement density target": conditions["place_density_target"],
+        "Placement density used": conditions["place_density_used"],
         "Clock period (ns)": conditions["clock_period_ns"],
+        "Routing layers": (
+            f"{conditions['route_min_layer']}-{conditions['route_max_layer']}"
+            if conditions["route_min_layer"] and conditions["route_max_layer"]
+            else None
+        ),
+        "GRT capacity derating": conditions["grt_layer_adjustment"],
         "Core area (µm²)": conditions["core_area_um2"],
         "Die width (µm)": conditions["die_width_um"],
         "Die height (µm)": conditions["die_height_um"],
@@ -2704,7 +3154,8 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "Requested utilization percentage. Optional in fixed mode."
+            "Requested utilization percentage. Required in utilization "
+            "mode; not applicable in fixed mode."
         ),
     )
 
@@ -2809,8 +3260,7 @@ def main() -> int:
         if manifest_mode == "utilization":
             if args.utilization is None:
                 raise ValueError(
-                    "Utilization floorplan mode requires --utilization "
-                    "or a corresponding value in the CLI."
+                    "Utilization floorplan mode requires --utilization."
                 )
 
         elif manifest_mode != "fixed":
@@ -2830,16 +3280,29 @@ def main() -> int:
             args.design_id,
         )
 
-        # 2. Pre-placement run conditions.
+        # 2. Actual floorplan geometry and flow diagnostics.
+        geometry_source, geometry_text = read_geometry_def(run_dir)
+        def_geometry = (
+            parse_def_geometry(geometry_text) if geometry_text else {}
+        )
+        diagnostics = parse_flow_diagnostics(run_dir)
+
+        # 3. Pre-placement run conditions.
         conditions = extract_run_conditions(
             args,
             manifest,
+            def_geometry,
+            geometry_source,
+            diagnostics,
         )
 
-        # 3. Physical-design targets.
+        # 4. Physical-design targets.
         post = physical_features(run_dir)
 
-        # 4. Strictly netlist-only model predictor dataset.
+        # 5. Capacity-sweep summary (only if a sweep was run).
+        sweep_rows = summarize_grt_sweep(run_dir, outdir)
+
+        # 6. Strictly netlist-only model predictor dataset.
         ml_inputs = model_input_features(pre)
 
         write_json(
@@ -2863,7 +3326,7 @@ def main() -> int:
             ml_inputs,
         )
 
-        # 5. Run conditions are independent of netlist features.
+        # 7. Run conditions are independent of netlist features.
         write_json(
             outdir / "run_conditions.json",
             conditions,
@@ -2874,7 +3337,7 @@ def main() -> int:
             conditions,
         )
 
-        # 6. Physical targets are never included in predictors.
+        # 8. Physical targets are never included in predictors.
         write_json(
             outdir / "physical_targets.json",
             post,
@@ -2885,7 +3348,7 @@ def main() -> int:
             post,
         )
 
-        # 7. Combined record for inspection only.
+        # 9. Combined record for inspection only.
         combined = {
             **pre,
             **conditions,
@@ -2902,7 +3365,7 @@ def main() -> int:
             combined,
         )
 
-        # 8. Configuration and flow-status record.
+        # 10. Configuration and flow-status record.
         write_configuration_csv(
             outdir,
             run_dir,
@@ -2911,7 +3374,7 @@ def main() -> int:
             conditions,
         )
 
-        # 9. Human-readable report.
+        # 11. Human-readable report.
         write_human_report(
             outdir,
             pre,
@@ -2921,7 +3384,7 @@ def main() -> int:
             run_dir,
         )
 
-        # 10. Excel workbook.
+        # 12. Excel workbook.
         xlsx_created = write_excel_workbook(
             outdir,
             pre,
@@ -2932,7 +3395,7 @@ def main() -> int:
             run_dir,
         )
 
-        # 11. Extraction status and provenance.
+        # 13. Extraction status and provenance.
         status = {
             "extraction_success": True,
             "design_id": args.design_id,
@@ -2943,6 +3406,8 @@ def main() -> int:
             "output_dir": str(outdir),
             "floorplan_mode": conditions["floorplan_mode"],
             "configuration_manifest_found": manifest is not None,
+            "geometry_source": conditions["geometry_source"],
+            "grt_sweep_points": len(sweep_rows),
             "netlist_model_input_feature_names": list(ml_inputs),
             "run_condition_feature_names": list(conditions),
             "model_input_policy": (
@@ -3012,6 +3477,16 @@ def main() -> int:
     for key, value in conditions.items():
         print(f"{key}: {value}")
 
+    mismatch = conditions.get("core_area_vs_requested_percent")
+
+    if mismatch is not None and abs(mismatch) > 5.0:
+        print(
+            "WARNING: actual core area differs from the requested core "
+            f"area by {mismatch:.1f}%. Check that the floorplan mode and "
+            "dimensions were applied as intended.",
+            file=sys.stderr,
+        )
+
     print("\n===== Physical Targets =====")
 
     for key in (
@@ -3024,16 +3499,19 @@ def main() -> int:
         "initial_grt_max_horizontal_congestion",
         "initial_grt_max_vertical_congestion",
         "initial_grt_total_congestion",
+        "initial_grt_has_overflow",
         "grt_total_resource",
         "grt_total_demand",
         "grt_usage_percent",
         "grt_max_horizontal_congestion",
         "grt_max_vertical_congestion",
         "grt_total_congestion",
+        "grt_has_overflow",
         "wirelength_um",
         "via_count",
         "final_detailed_route_violations",
         "design_area_um2",
+        "reported_core_utilization_percent",
         "effective_place_density",
     ):
         print(f"{key}: {post.get(key)}")
@@ -3052,6 +3530,9 @@ def main() -> int:
     print("  fir_features.csv")
     print("  run_report.md")
     print("  extraction_status.json")
+
+    if sweep_rows:
+        print(f"  grt_sweep_summary.csv ({len(sweep_rows)} points)")
 
     print(
         "Excel workbook: "
