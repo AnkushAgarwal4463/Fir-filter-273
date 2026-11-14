@@ -1,11 +1,12 @@
-
 # FIR physical-design flow for OpenROAD / Sky130HD.
 #
 # Supports:
-#   FLOORPLAN_MODE=utilization
-#   FLOORPLAN_MODE=fixed
+#   FLOORPLAN_MODE=utilization  (die/core from FLOORPLAN_UTIL; DIE_*/CORE_* ignored)
+#   FLOORPLAN_MODE=fixed        (explicit die/core in microns; UTIL ignored)
 #
-# Fixed mode uses explicit die and core coordinates in microns.
+# Global-routing resource knobs (all optional):
+#   ROUTE_MIN_LAYER / ROUTE_MAX_LAYER : routing layer range (default met1-met5)
+#   GRT_ADJ                           : capacity derating 0 <= x < 1 (default 0)
 #
 # Dataset policy:
 # Synthesized-netlist features are circuit predictors.
@@ -13,12 +14,23 @@
 # Floorplan conditions are recorded separately.
 
 # ------------------------------------------------------------
+# 0. Small helpers
+# ------------------------------------------------------------
+
+proc fir_env {name default} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} {
+        return $::env($name)
+    }
+    return $default
+}
+
+# ------------------------------------------------------------
 # 1. Validate environment variables
 # ------------------------------------------------------------
 
 foreach var {
     TECH_LEF CELL_LEF LIBERTY NETLIST SDC RUN_DIR
-    UTIL PLACE_DENSITY FLOORPLAN_MODE
+    PLACE_DENSITY FLOORPLAN_MODE
 } {
     if {![info exists ::env($var)] || $::env($var) eq ""} {
         puts stderr "ERROR: required environment variable $var is not set"
@@ -33,15 +45,8 @@ if {$floorplan_mode ni {utilization fixed}} {
     exit 1
 }
 
-foreach var {UTIL PLACE_DENSITY} {
-    if {![string is double -strict $::env($var)]} {
-        puts stderr "ERROR: $var must be numeric"
-        exit 1
-    }
-}
-
-if {$::env(UTIL) <= 0 || $::env(UTIL) > 80} {
-    puts stderr "ERROR: UTIL must be > 0 and <= 80 percent"
+if {![string is double -strict $::env(PLACE_DENSITY)]} {
+    puts stderr "ERROR: PLACE_DENSITY must be numeric"
     exit 1
 }
 
@@ -52,13 +57,18 @@ if {$::env(PLACE_DENSITY) <= 0 || $::env(PLACE_DENSITY) > 1} {
 
 if {$floorplan_mode eq "utilization"} {
 
-    foreach var {FLOORPLAN_UTIL CORE_AREA_SCALE} {
+    foreach var {UTIL FLOORPLAN_UTIL CORE_AREA_SCALE} {
         if {![info exists ::env($var)] ||
             $::env($var) eq "" ||
             ![string is double -strict $::env($var)]} {
             puts stderr "ERROR: $var must be numeric in utilization mode"
             exit 1
         }
+    }
+
+    if {$::env(UTIL) <= 0 || $::env(UTIL) > 80} {
+        puts stderr "ERROR: UTIL must be > 0 and <= 80 percent"
+        exit 1
     }
 
     if {$::env(FLOORPLAN_UTIL) <= 0 || $::env(FLOORPLAN_UTIL) > 80} {
@@ -109,6 +119,29 @@ if {$enable_repair_timing ni {0 1}} {
     puts stderr "ERROR: ENABLE_REPAIR_TIMING must be 0 or 1"
     exit 1
 }
+
+# Global-routing resource knobs.
+
+set route_min_layer [fir_env ROUTE_MIN_LAYER met1]
+set route_max_layer [fir_env ROUTE_MAX_LAYER met5]
+set grt_adj         [fir_env GRT_ADJ 0]
+
+if {$route_min_layer ni {met1 met2}} {
+    puts stderr "ERROR: ROUTE_MIN_LAYER must be met1 or met2"
+    exit 1
+}
+
+if {$route_max_layer ni {met3 met4 met5}} {
+    puts stderr "ERROR: ROUTE_MAX_LAYER must be met3, met4, or met5"
+    exit 1
+}
+
+if {![string is double -strict $grt_adj] || $grt_adj < 0 || $grt_adj >= 1} {
+    puts stderr "ERROR: GRT_ADJ must be a number with 0 <= GRT_ADJ < 1"
+    exit 1
+}
+
+set route_layers "$route_min_layer-$route_max_layer"
 
 # ------------------------------------------------------------
 # 2. Initialize run information
@@ -166,6 +199,30 @@ proc fir_step {stage command_list} {
     return $result
 }
 
+# Pre-placement geometry measurements taken from the OpenDB block.
+# Both return microns / square microns.
+
+proc fir_netlist_area_um2 {} {
+    set block [ord::get_db_block]
+    set dbu [$block getDbUnitsPerMicron]
+    set area 0.0
+
+    foreach inst [$block getInsts] {
+        set master [$inst getMaster]
+        set area [expr {$area + double([$master getWidth]) * double([$master getHeight])}]
+    }
+
+    return [expr {$area / (double($dbu) * double($dbu))}]
+}
+
+proc fir_core_area_um2 {} {
+    set block [ord::get_db_block]
+    set dbu [$block getDbUnitsPerMicron]
+    set core [$block getCoreArea]
+
+    return [expr {double([$core dx]) * double([$core dy]) / (double($dbu) * double($dbu))}]
+}
+
 # ------------------------------------------------------------
 # 4. Reset run-specific status and diagnostic files
 # ------------------------------------------------------------
@@ -183,13 +240,17 @@ fir_status "STARTED" "initialization"
 fir_log "RUN_ID: $::fir_run_id"
 fir_log "FLOORPLAN_MODE: $floorplan_mode"
 fir_log "ENABLE_REPAIR_TIMING: $enable_repair_timing"
-fir_log "REQUESTED_UTILIZATION: $::env(UTIL)"
-fir_log "PLACEMENT_DENSITY: $::env(PLACE_DENSITY)"
+fir_log "PLACEMENT_DENSITY_REQUESTED: $::env(PLACE_DENSITY)"
+fir_log "ROUTE_LAYERS: $route_layers"
+fir_log "GRT_LAYER_ADJUSTMENT: $grt_adj"
 
 if {$floorplan_mode eq "utilization"} {
+    fir_log "REQUESTED_UTILIZATION: $::env(UTIL)"
     fir_log "CORE_AREA_SCALE: $::env(CORE_AREA_SCALE)"
     fir_log "EFFECTIVE_FLOORPLAN_UTILIZATION: $::env(FLOORPLAN_UTIL)"
+    fir_log "NOTE: DIE_*/CORE_* variables are ignored in utilization mode"
 } else {
+    fir_log "NOTE: UTIL and CORE_AREA_SCALE are ignored in fixed mode"
     fir_log "DIE_WIDTH_UM: $::env(DIE_WIDTH)"
     fir_log "DIE_HEIGHT_UM: $::env(DIE_HEIGHT)"
     fir_log "CORE_LL_X_UM: $::env(CORE_LL_X)"
@@ -198,7 +259,7 @@ if {$floorplan_mode eq "utilization"} {
     fir_log "CORE_UR_Y_UM: $::env(CORE_UR_Y)"
 
     if {[info exists ::env(CORE_AREA_UM2)]} {
-        fir_log "CORE_AREA_UM2: $::env(CORE_AREA_UM2)"
+        fir_log "CORE_AREA_UM2_REQUESTED: $::env(CORE_AREA_UM2)"
     }
 }
 
@@ -246,7 +307,7 @@ if {$floorplan_mode eq "fixed"} {
 
 } else {
 
-    # Existing utilization-based floorplan.
+    # Utilization-based floorplan.
 
     fir_log "INITIALIZING_UTILIZATION_FLOORPLAN"
     fir_log "FLOORPLAN_UTIL: $::env(FLOORPLAN_UTIL)"
@@ -262,6 +323,56 @@ fir_step "make_tracks" [list make_tracks]
 fir_step "set_wire_rc" [list set_wire_rc -layer met2]
 
 # ------------------------------------------------------------
+# 6b. Measure the floorplan that OpenROAD actually created
+# ------------------------------------------------------------
+
+set netlist_area_um2 ""
+set core_area_actual_um2 ""
+set core_util_fraction ""
+
+if {[catch {
+    set netlist_area_um2 [fir_netlist_area_um2]
+    set core_area_actual_um2 [fir_core_area_um2]
+
+    if {$core_area_actual_um2 > 0} {
+        set core_util_fraction [expr {$netlist_area_um2 / $core_area_actual_um2}]
+    }
+} measure_msg]} {
+    fir_log "WARNING: floorplan measurement unavailable: $measure_msg"
+} else {
+    fir_log "PRE_PLACEMENT_NETLIST_AREA_UM2: [format %.4f $netlist_area_um2]"
+    fir_log "CORE_AREA_UM2_ACTUAL: [format %.4f $core_area_actual_um2]"
+
+    if {$core_util_fraction ne ""} {
+        fir_log "PRE_PLACEMENT_CORE_UTILIZATION_PERCENT: [format %.4f [expr {100.0 * $core_util_fraction}]]"
+    }
+}
+
+if {$core_util_fraction ne "" && $core_util_fraction >= 0.97} {
+    fir_log "ERROR: core utilization [format %.2f [expr {100.0 * $core_util_fraction}]]% is too high for placement; enlarge the core"
+    fir_status "FAILED" $::fir_last_completed_stage
+    error "core utilization too high"
+}
+
+# Global placement cannot meet a target density below the core
+# utilization. In fixed mode the requested density is therefore raised
+# when necessary, and the value actually used is logged.
+# Utilization mode keeps the original PLACE_DENSITY behaviour.
+
+set place_density $::env(PLACE_DENSITY)
+
+if {$floorplan_mode eq "fixed" && $core_util_fraction ne ""} {
+    set min_density [expr {min(1.0, $core_util_fraction + 0.05)}]
+
+    if {$place_density < $min_density} {
+        fir_log "PLACEMENT_DENSITY_ADJUSTED: requested [format %.4f $place_density] raised to [format %.4f $min_density] (core utilization is [format %.2f [expr {100.0 * $core_util_fraction}]]%)"
+        set place_density $min_density
+    }
+}
+
+fir_log "PLACEMENT_DENSITY_USED: [format %.4f $place_density]"
+
+# ------------------------------------------------------------
 # 7. Top-level I/O pin placement
 # ------------------------------------------------------------
 
@@ -274,11 +385,18 @@ fir_step "place_io_pins" [list place_pins \
 # ------------------------------------------------------------
 
 fir_step "global_placement" [list global_placement \
-    -density $::env(PLACE_DENSITY)]
+    -density $place_density]
 
 # ------------------------------------------------------------
 # 9. Design repair
 # ------------------------------------------------------------
+
+# Placement-based parasitics are needed for meaningful repair decisions.
+if {[catch {estimate_parasitics -placement} result]} {
+    fir_log "WARNING: estimate_parasitics -placement failed: $result"
+} else {
+    fir_log "OPTIONAL_STEP_COMPLETED: estimate_parasitics_placement"
+}
 
 if {[catch {repair_design} result]} {
     fir_log "WARNING: repair_design was skipped/failed: $result"
@@ -298,6 +416,8 @@ fir_step "detailed_placement" [list detailed_placement]
 
 if {$enable_repair_timing == 1} {
     fir_log "REPAIR_TIMING_ENABLED: true"
+
+    catch {estimate_parasitics -placement}
 
     if {[catch {repair_timing -setup -setup_margin 0.2} result]} {
         fir_log "WARNING: repair_timing was skipped/failed: $result"
@@ -340,6 +460,8 @@ set congestion_status_report \
 fir_step "write_pre_grt_odb" [list write_db $pre_grt_odb]
 
 # Run initial diagnostic routing in a fresh OpenROAD process.
+# It uses the same routing layers and capacity derating as the main run,
+# but performs no rip-up/reroute (-congestion_iterations 0).
 
 set diagnostic_fd [open $initial_congestion_script w]
 
@@ -347,6 +469,15 @@ puts $diagnostic_fd [list read_db $pre_grt_odb]
 puts $diagnostic_fd [list read_liberty $::env(LIBERTY)]
 puts $diagnostic_fd [list read_sdc $::env(SDC)]
 puts $diagnostic_fd [list set_wire_rc -layer met2]
+
+puts $diagnostic_fd [list set_routing_layers \
+    -signal $route_layers \
+    -clock $route_layers]
+
+if {$grt_adj > 0} {
+    puts $diagnostic_fd [list set_global_routing_layer_adjustment \
+        $route_layers $grt_adj]
+}
 
 puts $diagnostic_fd [list global_route \
     -congestion_iterations 0 \
@@ -409,6 +540,15 @@ if {[file exists $initial_congestion_summary]} {
 }
 
 # Main production global routing.
+
+fir_step "set_routing_layers" [list set_routing_layers \
+    -signal $route_layers \
+    -clock $route_layers]
+
+if {$grt_adj > 0} {
+    fir_step "set_global_routing_layer_adjustment" \
+        [list set_global_routing_layer_adjustment $route_layers $grt_adj]
+}
 
 fir_log "FINAL_GLOBAL_ROUTE_STARTED"
 
@@ -511,7 +651,9 @@ set detailed_route_drc_report \
     "$::env(RUN_DIR)/detailed_route_drc.rpt"
 
 fir_step "detailed_routing" [list detailed_route \
-    -output_drc $detailed_route_drc_report]
+    -output_drc $detailed_route_drc_report \
+    -bottom_routing_layer $route_min_layer \
+    -top_routing_layer $route_max_layer]
 
 puts "SUCCESS: Detailed routing"
 fir_log "SUCCESS: Detailed routing"
