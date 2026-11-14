@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -20,24 +19,43 @@ export CLK_PERIOD="${CLK_PERIOD:-${CLK_PERIOD_NS:-10.0}}"
 export ENABLE_REPAIR_TIMING="${ENABLE_REPAIR_TIMING:-1}"
 export CORE_AREA_SCALE="${CORE_AREA_SCALE:-0.7}"
 
-# Floorplan mode
+# Floorplan mode.
+#   utilization : die/core are derived from UTIL and CORE_AREA_SCALE.
+#                 DIE_* and CORE_* below are IGNORED in this mode.
+#   fixed       : die/core come from DIE_* and CORE_*.
+#                 UTIL and CORE_AREA_SCALE are IGNORED in this mode.
 export FLOORPLAN_MODE="${FLOORPLAN_MODE:-utilization}"
 
 # Fixed floorplan dimensions (microns)
-export DIE_WIDTH="${DIE_WIDTH:-240}"
-export DIE_HEIGHT="${DIE_HEIGHT:-240}"
+export DIE_WIDTH="${DIE_WIDTH:-250}"
+export DIE_HEIGHT="${DIE_HEIGHT:-250}"
 
 export CORE_LL_X="${CORE_LL_X:-5}"
 export CORE_LL_Y="${CORE_LL_Y:-5}"
-export CORE_UR_X="${CORE_UR_X:-235}"
-export CORE_UR_Y="${CORE_UR_Y:-235}"
+export CORE_UR_X="${CORE_UR_X:-245}"
+export CORE_UR_Y="${CORE_UR_Y:-245}"
 
-# Global-placement target for fixed-area mode
+# Global-placement target for fixed-area mode.
+# The Tcl flow raises this automatically if it is below the measured
+# core utilization (global placement cannot meet a density below utilization).
 export FIXED_PLACE_DENSITY="${FIXED_PLACE_DENSITY:-0.80}"
+
+# Global-routing resource knobs.
+#   ROUTE_MIN_LAYER / ROUTE_MAX_LAYER restrict the routing layers.
+#   GRT_ADJ derates global-routing capacity on those layers (0 <= GRT_ADJ < 1).
+#   These change routing RESOURCES only; they do not change the placement.
+export ROUTE_MIN_LAYER="${ROUTE_MIN_LAYER:-met1}"
+export ROUTE_MAX_LAYER="${ROUTE_MAX_LAYER:-met5}"
+export GRT_ADJ="${GRT_ADJ:-0}"
 
 # ------------------------------------------------------------
 # 1. Validate design and experiment parameters
 # ------------------------------------------------------------
+
+case "$FLOORPLAN_MODE" in
+    utilization|fixed) ;;
+    *) echo "ERROR: FLOORPLAN_MODE must be utilization or fixed."; exit 2 ;;
+esac
 
 if ! [[ "$TAPS" =~ ^[0-9]+$ ]] || (( TAPS < 4 || TAPS > 32 || TAPS % 4 != 0 )); then
     echo "ERROR: TAPS must be a multiple of 4 between 4 and 32."
@@ -54,10 +72,16 @@ esac
     exit 2
 }
 
-case "$UTIL" in
-    20|30|40|50|60|70|80) ;;
-    *) echo "ERROR: UTIL must be 20, 30, 40, 50, 60, 70, or 80."; exit 2 ;;
-esac
+# UTIL only exists in utilization mode. In fixed mode it is not applicable
+# and is cleared so that no fake "requested utilization" is recorded.
+if [[ "$FLOORPLAN_MODE" == "utilization" ]]; then
+    case "$UTIL" in
+        20|30|40|50|60|70|80) ;;
+        *) echo "ERROR: UTIL must be 20, 30, 40, 50, 60, 70, or 80."; exit 2 ;;
+    esac
+else
+    export UTIL=""
+fi
 
 [[ "$ACC_WIDTH" =~ ^[0-9]+$ ]] || {
     echo "ERROR: ACC_WIDTH must be an integer."
@@ -79,6 +103,24 @@ case "$CLK_PERIOD" in
     *) echo "ERROR: CLK_PERIOD must be 5, 7.5, or 10 ns."; exit 2 ;;
 esac
 
+# Routing-layer range. I/O pins are placed on met3 (horizontal) and met2
+# (vertical), so the routing range must include both layers.
+case "$ROUTE_MIN_LAYER" in
+    met1|met2) ;;
+    *) echo "ERROR: ROUTE_MIN_LAYER must be met1 or met2."; exit 2 ;;
+esac
+
+case "$ROUTE_MAX_LAYER" in
+    met3|met4|met5) ;;
+    *) echo "ERROR: ROUTE_MAX_LAYER must be met3, met4, or met5."; exit 2 ;;
+esac
+
+awk -v a="$GRT_ADJ" \
+    'BEGIN { exit !(a ~ /^[0-9]+([.][0-9]+)?$/ && a >= 0 && a < 1) }' || {
+    echo "ERROR: GRT_ADJ must be a number with 0 <= GRT_ADJ < 1."
+    exit 2
+}
+
 # ------------------------------------------------------------
 # 2. Configure floorplan
 # ------------------------------------------------------------
@@ -86,7 +128,8 @@ esac
 case "$FLOORPLAN_MODE" in
 
     utilization)
-        # Existing utilization-based floorplanning.
+        # Utilization-based floorplanning.
+        echo "NOTE: FLOORPLAN_MODE=utilization -> DIE_*/CORE_* settings are ignored."
 
         awk -v s="$CORE_AREA_SCALE" \
             'BEGIN { exit !(s >= 0.60 && s <= 1.00) }' || {
@@ -110,12 +153,15 @@ case "$FLOORPLAN_MODE" in
             'BEGIN { printf "%.4f", u / 100.0 }')"
 
         export CORE_AREA_UM2=""
+        export CORE_WIDTH_UM=""
+        export CORE_HEIGHT_UM=""
         export FIXED_CORE_UTILIZATION=""
 
         ;;
 
     fixed)
         # Fixed die/core dimensions.
+        echo "NOTE: FLOORPLAN_MODE=fixed -> UTIL and CORE_AREA_SCALE are ignored."
 
         for var in DIE_WIDTH DIE_HEIGHT CORE_LL_X CORE_LL_Y CORE_UR_X CORE_UR_Y FIXED_PLACE_DENSITY; do
             value="${!var}"
@@ -152,7 +198,7 @@ case "$FLOORPLAN_MODE" in
                 exit 2
             }
 
-        # Calculate core dimensions and area.
+        # Calculate requested core dimensions and area.
 
         export CORE_WIDTH_UM
         export CORE_HEIGHT_UM
@@ -167,7 +213,8 @@ case "$FLOORPLAN_MODE" in
         CORE_AREA_UM2="$(awk -v w="$CORE_WIDTH_UM" -v h="$CORE_HEIGHT_UM" \
             'BEGIN { printf "%.4f", w*h }')"
 
-        # Placement target is independently configurable in fixed mode.
+        # Requested placement target. The Tcl flow raises it if it is
+        # below the measured core utilization and logs the value used.
 
         export PLACE_DENSITY="$FIXED_PLACE_DENSITY"
 
@@ -177,19 +224,11 @@ case "$FLOORPLAN_MODE" in
             exit 2
         }
 
-        # Calculate approximate utilization after synthesis.
-        # This is filled later, after the netlist has been synthesized.
-
         export FIXED_CORE_UTILIZATION=""
 
         # Utilization-based parameters are not applicable.
 
         export FLOORPLAN_UTIL=""
-        ;;
-
-    *)
-        echo "ERROR: FLOORPLAN_MODE must be utilization or fixed."
-        exit 2
         ;;
 esac
 
@@ -218,6 +257,21 @@ else
     RUN_TAG_BASE="fir_t${TAPS}_dw${DATA_WIDTH}_cw${COEFF_WIDTH}_aw${ACC_WIDTH}_u${UTIL}_ca${CORE_AREA_TAG}_clk${CLK_TAG}"
 
 fi
+
+# Routing knobs are added to the tag only when they differ from the
+# defaults, so existing run names are not changed.
+ROUTE_TAG=""
+
+if [[ "$ROUTE_MIN_LAYER" != "met1" || "$ROUTE_MAX_LAYER" != "met5" ]]; then
+    ROUTE_TAG="${ROUTE_TAG}_rl${ROUTE_MIN_LAYER#met}-${ROUTE_MAX_LAYER#met}"
+fi
+
+if awk -v a="$GRT_ADJ" 'BEGIN { exit !(a > 0) }'; then
+    ADJ_TAG="$(awk -v a="$GRT_ADJ" 'BEGIN { printf "%g", a + 0 }')"
+    ROUTE_TAG="${ROUTE_TAG}_adj${ADJ_TAG}"
+fi
+
+RUN_TAG_BASE="${RUN_TAG_BASE}${ROUTE_TAG}"
 
 if [[ "$ENABLE_REPAIR_TIMING" == 0 ]]; then
     export RUN_TAG="${RUN_TAG_BASE}_tr0"
@@ -254,12 +308,14 @@ printf '%s\n' \
     "COEFF_WIDTH=$COEFF_WIDTH" \
     "ACC_WIDTH=$ACC_WIDTH" \
     "FLOORPLAN_MODE=$FLOORPLAN_MODE" \
-    "REQUESTED_UTIL=$UTIL%" \
-    "CORE_AREA_SCALE=$CORE_AREA_SCALE" \
+    "REQUESTED_UTIL=${UTIL:-not_applicable}" \
+    "CORE_AREA_SCALE=$([[ "$FLOORPLAN_MODE" == utilization ]] && echo "$CORE_AREA_SCALE" || echo not_applicable)" \
     "FLOORPLAN_UTIL=${FLOORPLAN_UTIL:-not_applicable}" \
     "PLACE_DENSITY=$PLACE_DENSITY" \
     "CLK_PERIOD=$CLK_PERIOD ns" \
     "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING" \
+    "ROUTE_LAYERS=${ROUTE_MIN_LAYER}-${ROUTE_MAX_LAYER}" \
+    "GRT_ADJ=$GRT_ADJ" \
     "RUN_TAG=$RUN_TAG"
 
 if [[ "$FLOORPLAN_MODE" == "fixed" ]]; then
@@ -478,7 +534,10 @@ data = {
 
     "floorplan_mode": mode,
 
-    "requested_utilization_percent": float(os.environ["UTIL"]),
+    # Utilization-mode-only conditions are null in fixed mode.
+    "requested_utilization_percent": (
+        optional_float("UTIL") if mode == "utilization" else None
+    ),
     "floorplan_utilization_percent": optional_float("FLOORPLAN_UTIL"),
     "core_area_scale": (
         optional_float("CORE_AREA_SCALE")
@@ -491,6 +550,8 @@ data = {
         if mode == "fixed" else None
     ),
 
+    # Requested fixed-mode geometry. Actual geometry is measured from the
+    # DEF by the extractor.
     "die_width_um": (
         float(os.environ["DIE_WIDTH"]) if mode == "fixed" else None
     ),
@@ -522,6 +583,11 @@ data = {
     "enable_repair_timing": repair,
     "repair_timing_mode": "enabled" if repair else "disabled_diagnostic",
 
+    # Global-routing resource conditions.
+    "route_min_layer": os.environ["ROUTE_MIN_LAYER"],
+    "route_max_layer": os.environ["ROUTE_MAX_LAYER"],
+    "grt_layer_adjustment": float(os.environ["GRT_ADJ"]),
+
     "netlist_verilog": os.environ["NETLIST"],
     "netlist_json": os.environ["NETLIST_JSON"],
     "sdc_file": os.environ["SDC"],
@@ -543,6 +609,7 @@ export FLOORPLAN_MODE DIE_WIDTH DIE_HEIGHT
 export CORE_LL_X CORE_LL_Y CORE_UR_X CORE_UR_Y
 export CORE_AREA_UM2 CORE_WIDTH_UM CORE_HEIGHT_UM
 export FIXED_PLACE_DENSITY
+export ROUTE_MIN_LAYER ROUTE_MAX_LAYER GRT_ADJ
 
 # ------------------------------------------------------------
 # 11. Run OpenROAD
@@ -575,22 +642,30 @@ printf 'final.def=%s final.odb=%s pre_drt.def=%s pre_drt.odb=%s\n' \
 # 12. Extract pre-placement features and physical targets
 # ------------------------------------------------------------
 
+EXTRACT_ARGS=(
+    --netlist-json "$NETLIST_JSON"
+    --run-dir "$RUN_DIR"
+    --outdir "$RUN_DIR"
+    --top fir_filter
+    --design-id "$DESIGN_ID"
+    --run-id "$RUN_TAG"
+    --taps "$TAPS"
+    --data-width "$DATA_WIDTH"
+    --coeff-width "$COEFF_WIDTH"
+    --acc-width "$ACC_WIDTH"
+    --floorplan-mode "$FLOORPLAN_MODE"
+    --place-density "$PLACE_DENSITY"
+    --clock-period "$CLK_PERIOD"
+)
+
+# Requested utilization exists only in utilization mode.
+if [[ "$FLOORPLAN_MODE" == "utilization" ]]; then
+    EXTRACT_ARGS+=(--utilization "$UTIL")
+fi
+
 EXTRACTION_STATUS=0
 
-if python3 scripts/extract_fir_features.py \
-    --netlist-json "$NETLIST_JSON" \
-    --run-dir "$RUN_DIR" \
-    --outdir "$RUN_DIR" \
-    --top fir_filter \
-    --design-id "$DESIGN_ID" \
-    --run-id "$RUN_TAG" \
-    --taps "$TAPS" \
-    --data-width "$DATA_WIDTH" \
-    --coeff-width "$COEFF_WIDTH" \
-    --acc-width "$ACC_WIDTH" \
-    --utilization "$UTIL" \
-    --place-density "$PLACE_DENSITY" \
-    --clock-period "$CLK_PERIOD"; then
+if python3 scripts/extract_fir_features.py "${EXTRACT_ARGS[@]}"; then
 
     echo "Feature extraction completed."
 
@@ -641,5 +716,15 @@ done
     echo "ERROR: OpenROAD succeeded but final DEF/ODB are incomplete."
     exit 4
 }
+
+# ------------------------------------------------------------
+# 13. Optional capacity sweep on the saved pre-GRT placement
+#     (RUN_GRT_SWEEP=1, optional GRT_SWEEP_VALUES="0 0.5 0.8 0.9")
+# ------------------------------------------------------------
+
+if [[ "${RUN_GRT_SWEEP:-0}" == "1" ]]; then
+    # shellcheck disable=SC2086
+    bash scripts/run_grt_sweep.sh "$RUN_DIR" ${GRT_SWEEP_VALUES:-}
+fi
 
 echo "FIR flow completed successfully: $RUN_TAG"
