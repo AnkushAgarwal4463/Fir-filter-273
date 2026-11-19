@@ -1,4 +1,3 @@
-
 name: FIR Synthesis and Physical Design
 
 on:
@@ -11,7 +10,7 @@ on:
         options:
           - sweep
           - single
-        default: sweep
+        default: single
 
       taps:
         description: "FIR taps (single mode)"
@@ -42,7 +41,7 @@ on:
         default: "8"
 
       utilization:
-        description: "Target utilization (%) (single mode)"
+        description: "Target utilization (%) (single mode, utilization floorplan)"
         required: true
         type: choice
         options:
@@ -59,6 +58,30 @@ on:
         description: "Clock period in ns (single mode)"
         required: true
         default: "10.0"
+
+      floorplan_mode:
+        description: "Floorplan mode (single mode)"
+        required: true
+        type: choice
+        options:
+          - utilization
+          - fixed
+        default: utilization
+
+      die_size_um:
+        description: "Square die side in um (single mode, fixed floorplan only; core = die minus 5 um margin)"
+        required: false
+        default: "230"
+
+      grt_adj:
+        description: "GRT capacity derating 0 <= x < 1 for the main run (single mode)"
+        required: false
+        default: "0"
+
+      grt_sweep_values:
+        description: "Space-separated GRT derating values to sweep on the saved placement (single mode; blank = no sweep)"
+        required: false
+        default: "0 0.5 0.7 0.8 0.9 0.95"
 
   push:
     paths:
@@ -97,11 +120,25 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+  # Push and pull_request events have no inputs. They run ONE small
+  # configuration as a smoke test instead of the full 336-job sweep.
+  RUN_MODE: ${{ inputs.run_mode || 'single' }}
   SINGLE_TAPS: ${{ inputs.taps || '8' }}
   SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
   SINGLE_UTIL: ${{ inputs.utilization || '40' }}
   SINGLE_CLOCK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+  SINGLE_FLOORPLAN_MODE: ${{ inputs.floorplan_mode || 'utilization' }}
+  SINGLE_DIE_SIZE: ${{ inputs.die_size_um || '230' }}
+  SINGLE_GRT_ADJ: ${{ inputs.grt_adj || '0' }}
+  SINGLE_SWEEP_VALUES: ${{ inputs.grt_sweep_values || '' }}
+
+  # Utilization floorplans use UTIL / CORE_AREA_SCALE. With the old default
+  # of 0.7, UTIL = 60, 70 and 80 give 86-114% and are rejected, so the
+  # utilization sweep uses 1.0 (actual core utilization = UTIL).
+  SWEEP_CORE_AREA_SCALE: "1.0"
+
+  # GRT capacity-derating points run on every saved placement in sweep mode.
+  DEFAULT_SWEEP_VALUES: "0 0.5 0.7 0.8 0.9 0.95"
 
 jobs:
 
@@ -136,6 +173,7 @@ jobs:
             rtl/fir_filter.v
             tb/tb_fir_filter.v
             scripts/run_fir_flow.sh
+            scripts/run_grt_sweep.sh
             scripts/flow_fir.tcl
             scripts/synth_fir.ys
             scripts/extract_fir_features.py
@@ -172,6 +210,7 @@ jobs:
           openroad -version
 
           bash -n scripts/run_fir_flow.sh
+          bash -n scripts/run_grt_sweep.sh
 
           python -m py_compile \
             scripts/extract_fir_features.py \
@@ -187,6 +226,12 @@ jobs:
           DATA_WIDTH: ${{ env.SINGLE_DATA_WIDTH }}
           UTILIZATION: ${{ env.SINGLE_UTIL }}
           SINGLE_CLOCK_PERIOD: ${{ env.SINGLE_CLOCK_PERIOD }}
+          FP_MODE: ${{ env.SINGLE_FLOORPLAN_MODE }}
+          DIE_SIZE: ${{ env.SINGLE_DIE_SIZE }}
+          GRT_ADJ_IN: ${{ env.SINGLE_GRT_ADJ }}
+          SWEEP_VALUES_IN: ${{ env.SINGLE_SWEEP_VALUES }}
+          SWEEP_CORE_AREA_SCALE: ${{ env.SWEEP_CORE_AREA_SCALE }}
+          DEFAULT_SWEEP_VALUES: ${{ env.DEFAULT_SWEEP_VALUES }}
 
         run: |
           set -euo pipefail
@@ -204,6 +249,11 @@ jobs:
 
           periods = (5.0, 7.5, 10.0)
 
+          scale = float(os.environ["SWEEP_CORE_AREA_SCALE"])
+
+          if not (0.60 <= scale <= 1.00):
+              raise SystemExit("SWEEP_CORE_AREA_SCALE must be 0.60-1.00")
+
           def validate(taps, width, util, clock):
               if taps not in allowed_taps:
                   raise SystemExit(f"Unsupported TAPS: {taps}")
@@ -217,6 +267,52 @@ jobs:
               if not math.isfinite(clock) or clock <= 0:
                   raise SystemExit("Clock period must be positive.")
 
+              # Utilization floorplans must stay within the flow's 80% limit.
+              if util / scale > 80.0:
+                  raise SystemExit(
+                      f"UTIL={util} with CORE_AREA_SCALE={scale:g} gives "
+                      f"{util / scale:.1f}% floorplan utilization (> 80%)."
+                  )
+
+          def parse_sweep_values(text):
+              values = text.split()
+
+              for value in values:
+                  number = float(value)
+
+                  if not (0.0 <= number < 1.0):
+                      raise SystemExit(
+                          f"GRT sweep value {value} must satisfy 0 <= x < 1"
+                      )
+
+              return " ".join(values)
+
+          def make_config(taps, width, util, clock,
+                          floorplan_mode, die_size, adj, sweep_values):
+              if floorplan_mode == "fixed":
+                  tag = f"t{taps}-dw{width}-fixed{die_size}-clk{clock:g}"
+              else:
+                  tag = f"t{taps}-dw{width}-u{util}-clk{clock:g}"
+
+              if adj > 0:
+                  tag += f"-adj{adj:g}"
+
+              tag += "-tr0"
+
+              return {
+                  "taps": taps,
+                  "data_width": width,
+                  "acc_width": width + 8 + 8,
+                  "utilization": util,
+                  "clock_period": clock,
+                  "floorplan_mode": floorplan_mode,
+                  "die_size": die_size,
+                  "core_area_scale": f"{scale:g}",
+                  "grt_adj": f"{adj:g}",
+                  "sweep_values": sweep_values,
+                  "tag": tag,
+              }
+
           configs = []
 
           if mode == "single":
@@ -226,17 +322,50 @@ jobs:
               util = int(os.environ["UTILIZATION"])
               clock = float(os.environ["SINGLE_CLOCK_PERIOD"])
 
-              validate(taps, width, util, clock)
+              fp_mode = os.environ["FP_MODE"]
 
-              configs.append({
-                  "taps": taps,
-                  "data_width": width,
-                  "acc_width": width + 8 + 8,
-                  "utilization": util,
-                  "clock_period": clock,
-              })
+              if fp_mode not in ("utilization", "fixed"):
+                  raise SystemExit(f"Unsupported floorplan mode: {fp_mode}")
+
+              if fp_mode == "fixed":
+                  die_size = int(os.environ["DIE_SIZE"])
+
+                  if not (100 <= die_size <= 600):
+                      raise SystemExit("die_size_um must be 100-600")
+
+                  die_text = str(die_size)
+
+                  # UTIL is ignored by the flow in fixed mode; validate only
+                  # the generic ranges.
+                  if taps not in allowed_taps or width not in allowed_widths:
+                      raise SystemExit("Unsupported TAPS or DATA_WIDTH")
+
+                  if not math.isfinite(clock) or clock <= 0:
+                      raise SystemExit("Clock period must be positive.")
+
+              else:
+                  validate(taps, width, util, clock)
+                  die_text = ""
+
+              adj = float(os.environ["GRT_ADJ_IN"] or "0")
+
+              if not (0.0 <= adj < 1.0):
+                  raise SystemExit("grt_adj must satisfy 0 <= x < 1")
+
+              sweep_values = parse_sweep_values(
+                  os.environ["SWEEP_VALUES_IN"]
+              )
+
+              configs.append(make_config(
+                  taps, width, util, clock,
+                  fp_mode, die_text, adj, sweep_values,
+              ))
 
           elif mode == "sweep":
+
+              default_sweep = parse_sweep_values(
+                  os.environ["DEFAULT_SWEEP_VALUES"]
+              )
 
               # Eight tap counts x two data widths
               # x seven utilization values x three clocks.
@@ -247,13 +376,10 @@ jobs:
 
                               validate(taps, width, util, clock)
 
-                              configs.append({
-                                  "taps": taps,
-                                  "data_width": width,
-                                  "acc_width": width + 8 + 8,
-                                  "utilization": util,
-                                  "clock_period": clock,
-                              })
+                              configs.append(make_config(
+                                  taps, width, util, clock,
+                                  "utilization", "", 0.0, default_sweep,
+                              ))
 
               if len(configs) != 336:
                   raise SystemExit(
@@ -279,6 +405,9 @@ jobs:
           print(f"Run mode: {mode}")
           print(f"Clock periods: {periods if mode == 'sweep' else 'single'}")
           print(f"Number of configurations: {len(configs)}")
+
+          for config in configs[:3]:
+              print(json.dumps(config))
           PY
 
   # --------------------------------------------------
@@ -306,6 +435,13 @@ jobs:
       ACC_WIDTH: ${{ matrix.acc_width }}
       UTIL: ${{ matrix.utilization }}
       CLK_PERIOD: ${{ matrix.clock_period }}
+
+      # Floorplan and global-routing conditions.
+      FLOORPLAN_MODE: ${{ matrix.floorplan_mode }}
+      CORE_AREA_SCALE: ${{ matrix.core_area_scale }}
+      DIE_SIZE: ${{ matrix.die_size }}
+      GRT_ADJ: ${{ matrix.grt_adj }}
+      GRT_SWEEP_VALUES: ${{ matrix.sweep_values }}
 
       # Diagnostic sweep: timing repair disabled.
       ENABLE_REPAIR_TIMING: "0"
@@ -367,6 +503,11 @@ jobs:
           echo "UTIL=$UTIL"
           echo "CLK_PERIOD=$CLK_PERIOD"
           echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
+          echo "FLOORPLAN_MODE=$FLOORPLAN_MODE"
+          echo "CORE_AREA_SCALE=$CORE_AREA_SCALE"
+          echo "DIE_SIZE=${DIE_SIZE:-not_applicable}"
+          echo "GRT_ADJ=$GRT_ADJ"
+          echo "GRT_SWEEP_VALUES=${GRT_SWEEP_VALUES:-none}"
 
           test "$ENABLE_REPAIR_TIMING" = "0"
 
@@ -375,6 +516,12 @@ jobs:
 
           (( ACC_WIDTH == DATA_WIDTH + COEFF_WIDTH + 8 ))
 
+          case "$FLOORPLAN_MODE" in
+            utilization) ;;
+            fixed) test -n "$DIE_SIZE" ;;
+            *) echo "ERROR: bad FLOORPLAN_MODE=$FLOORPLAN_MODE"; exit 1 ;;
+          esac
+
       - name: Run FIR physical-design configuration
         id: physical_flow
         run: |
@@ -382,16 +529,29 @@ jobs:
 
           source /OpenROAD-flow-scripts/env.sh
 
-          chmod +x scripts/run_fir_flow.sh
+          chmod +x scripts/run_fir_flow.sh scripts/run_grt_sweep.sh
+
+          # Fixed floorplan: square die, 5 um margin on every side.
+          if [ "$FLOORPLAN_MODE" = "fixed" ]; then
+            export DIE_WIDTH="$DIE_SIZE"
+            export DIE_HEIGHT="$DIE_SIZE"
+            export CORE_LL_X=5
+            export CORE_LL_Y=5
+            export CORE_UR_X=$(( DIE_SIZE - 5 ))
+            export CORE_UR_Y=$(( DIE_SIZE - 5 ))
+            export FIXED_PLACE_DENSITY=0.85
+          fi
+
+          # Capacity-derating sweep on the saved placement.
+          if [ -n "${GRT_SWEEP_VALUES:-}" ]; then
+            export RUN_GRT_SWEEP=1
+          fi
 
           echo "Configuration:"
-          echo "TAPS=$TAPS"
-          echo "DATA_WIDTH=$DATA_WIDTH"
-          echo "COEFF_WIDTH=$COEFF_WIDTH"
-          echo "ACC_WIDTH=$ACC_WIDTH"
-          echo "UTIL=$UTIL"
-          echo "CLK_PERIOD=$CLK_PERIOD ns"
-          echo "ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING"
+          echo "TAPS=$TAPS DATA_WIDTH=$DATA_WIDTH ACC_WIDTH=$ACC_WIDTH"
+          echo "FLOORPLAN_MODE=$FLOORPLAN_MODE UTIL=$UTIL CORE_AREA_SCALE=$CORE_AREA_SCALE"
+          echo "CLK_PERIOD=$CLK_PERIOD ns GRT_ADJ=$GRT_ADJ"
+          echo "RUN_GRT_SWEEP=${RUN_GRT_SWEEP:-0} GRT_SWEEP_VALUES=${GRT_SWEEP_VALUES:-none}"
 
           ./scripts/run_fir_flow.sh
 
@@ -418,20 +578,53 @@ jobs:
           acc_width = int(os.environ["ACC_WIDTH"])
           utilization = int(os.environ["UTIL"])
           clock = float(os.environ["CLK_PERIOD"])
+          floorplan_mode = os.environ["FLOORPLAN_MODE"]
 
           repair_mode = os.environ.get(
               "ENABLE_REPAIR_TIMING", "1"
           )
 
-          run_id = (
-              f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
-              f"_aw{acc_width}_u{utilization}_clk{clock:g}"
-          )
+          # The flow names the run directory itself (it contains the
+          # floorplan scale, die size and routing knobs), so locate the
+          # directory instead of rebuilding its name. Each job has exactly
+          # one run directory; the glob guards against stray directories.
+          runs_root = Path("fir_project/runs")
 
-          if repair_mode == "0":
-              run_id += "_tr0"
+          candidates = sorted(
+              (
+                  path for path in runs_root.glob(
+                      f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
+                      f"_aw{acc_width}_*"
+                  )
+                  if path.is_dir()
+              ),
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          ) if runs_root.is_dir() else []
 
-          run_dir = Path("fir_project/runs") / run_id
+          if candidates:
+              run_dir = candidates[0]
+              run_id = run_dir.name
+          else:
+              # The flow stopped before creating a run directory
+              # (for example, parameter validation failed).
+              run_id = (
+                  f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
+                  f"_aw{acc_width}_{floorplan_mode}_no_run_dir"
+                  f"_clk{clock:g}"
+              )
+              run_dir = runs_root / run_id
+
+          manifest = {}
+          manifest_path = run_dir / "configuration.json"
+
+          if manifest_path.is_file():
+              try:
+                  manifest = json.loads(
+                      manifest_path.read_text(encoding="utf-8")
+                  )
+              except (OSError, json.JSONDecodeError):
+                  manifest = {}
 
           stage = "unknown"
           status_csv = run_dir / "fir_features_status.csv"
@@ -494,7 +687,14 @@ jobs:
               "coeff_width": coeff_width,
               "acc_width": acc_width,
               "utilization": utilization,
-              "place_density": utilization / 100.0,
+              "floorplan_mode": floorplan_mode,
+              # Recorded by the flow; None when the flow did not get far
+              # enough to write configuration.json.
+              "place_density": manifest.get("place_density"),
+              "core_area_scale": manifest.get("core_area_scale"),
+              "route_min_layer": manifest.get("route_min_layer"),
+              "route_max_layer": manifest.get("route_max_layer"),
+              "grt_layer_adjustment": manifest.get("grt_layer_adjustment"),
               "clock_period": clock,
               "clock_period_ns": clock,
               "frequency_mhz": 1000.0 / clock,
@@ -523,7 +723,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fir-config-t${{ matrix.taps }}-dw${{ matrix.data_width }}-u${{ matrix.utilization }}-clk${{ matrix.clock_period }}-tr0
+          name: fir-config-${{ matrix.tag }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -573,7 +773,7 @@ jobs:
 
       - name: Build combined CSV
         env:
-          RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+          RUN_MODE: ${{ inputs.run_mode || 'single' }}
           SINGLE_TAPS: ${{ inputs.taps || '8' }}
           SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
           SINGLE_UTIL: ${{ inputs.utilization || '40' }}
