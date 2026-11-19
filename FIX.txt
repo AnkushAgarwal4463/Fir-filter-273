@@ -1,0 +1,7 @@
+```tcl
+# Put this before detailed routing.
+set_routing_layers -signal $route_layers
+
+fir_step "detailed_routing" [list detailed_route \
+    -output_drc $detailed_route_drc_report]
+```
