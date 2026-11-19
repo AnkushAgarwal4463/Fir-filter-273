@@ -651,9 +651,7 @@ set detailed_route_drc_report \
     "$::env(RUN_DIR)/detailed_route_drc.rpt"
 
 fir_step "detailed_routing" [list detailed_route \
-    -output_drc $detailed_route_drc_report \
-    -bottom_routing_layer $route_min_layer \
-    -top_routing_layer $route_max_layer]
+    -output_drc $detailed_route_drc_report]
 
 puts "SUCCESS: Detailed routing"
 fir_log "SUCCESS: Detailed routing"
