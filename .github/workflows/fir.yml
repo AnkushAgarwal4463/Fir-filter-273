@@ -451,6 +451,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # Run directories are generated output. If any were committed to the
+      # repository they arrive with the checkout, the flow refuses to
+      # overwrite them ("Run directory already exists"), and they would also
+      # be uploaded inside every configuration's artifact. Start clean.
+      - name: Remove stale run outputs from the checkout
+        run: |
+          set -euo pipefail
+
+          if [ -d fir_project/runs ]; then
+            echo "WARNING: fir_project/runs came from the repository checkout:"
+            ls fir_project/runs | head -20
+            echo "These are committed generated files; see .gitignore advice."
+          fi
+
+          rm -rf fir_project/runs fir_project/matrix-status
+
       - name: Set up Python and EDA environment
         uses: mamba-org/setup-micromamba@v2
         with:
